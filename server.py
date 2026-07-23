@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -172,5 +173,9 @@ def read_article(
 
 
 if __name__ == "__main__":
+    # libzim/Xapian writes diagnostics directly to fd 1. Keep JSON-RPC on a
+    # duplicate of the original stdout and send native diagnostics to stderr.
+    protocol_stdout = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = protocol_stdout
     mcp.run(transport="stdio")
-
