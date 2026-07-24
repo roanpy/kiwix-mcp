@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,7 +49,7 @@ def test_zim_image_url_resolution() -> None:
 
 
 def test_extract_image_returns_native_mcp_content(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     item = SimpleNamespace(mimetype="image/webp", size=3, content=b"img")
     entry = SimpleNamespace(is_redirect=False, get_item=lambda: item)
@@ -64,6 +65,11 @@ def test_extract_image_returns_native_mcp_content(
         server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
     )
     monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(server, "IMAGE_TEMP_DIR", tmp_path)
+    monkeypatch.setattr(server, "MAX_TEMP_IMAGES", 1)
+    old = tmp_path / "old.webp"
+    old.write_bytes(b"old")
+    os.utime(old, ns=(1, 1))
 
     content = asyncio.run(
         server.mcp._tool_manager.call_tool(
@@ -75,3 +81,5 @@ def test_extract_image_returns_native_mcp_content(
     assert isinstance(content[0], TextContent)
     assert isinstance(content[1], ImageContent)
     assert content[1].mimeType == "image/webp"
+    assert next(tmp_path.iterdir()).read_bytes() == b"img"
+    assert not old.exists()

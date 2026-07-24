@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import mimetypes
 import os
 import posixpath
 import sys
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -14,8 +17,10 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 
 DEFAULT_ARCHIVE_DIR = Path("/Users/user/.chroma_db/kiwix/archives")
+IMAGE_TEMP_DIR = Path(tempfile.gettempdir()) / "kiwix-mcp"
 MAX_ARTICLE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_TEMP_IMAGES = 16
 
 mcp = FastMCP(
     "kiwix",
@@ -276,6 +281,24 @@ def _resolve_image_path(article_path: str, src: str) -> str:
     ).lstrip("/")
 
 
+def _cache_image(raw: bytes, mimetype: str) -> Path:
+    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = mimetypes.guess_extension(mimetype) or ".img"
+    file_path = IMAGE_TEMP_DIR / f"{hashlib.sha256(raw).hexdigest()[:16]}{suffix}"
+    if file_path.exists():
+        file_path.touch()
+    else:
+        file_path.write_bytes(raw)
+    files = sorted(
+        (path for path in IMAGE_TEMP_DIR.iterdir() if path.is_file()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in files[MAX_TEMP_IMAGES:]:
+        stale.unlink(missing_ok=True)
+    return file_path
+
+
 def _extract_image(archive: Archive, article_path: str, image_index: int) -> list[Any]:
     """Return image metadata followed by native MCP image content."""
     images = _find_images_in_article(archive, article_path)
@@ -297,8 +320,10 @@ def _extract_image(archive: Archive, article_path: str, image_index: int) -> lis
         raise ValueError(f"Image too large: {img_item.size} bytes")
 
     raw = bytes(img_item.content)
+    file_path = _cache_image(raw, img_item.mimetype)
     metadata = {
         "status": "ok",
+        "file_path": str(file_path),
         "mimetype": img_item.mimetype,
         "size_bytes": img_item.size,
         "image_index": image_index,
@@ -314,7 +339,10 @@ def _extract_image(archive: Archive, article_path: str, image_index: int) -> lis
 def extract_image(
     archive_id: str, article_path: str, image_index: int = 0
 ) -> list[Any]:
-    """Return one article image as native MCP image content."""
+    """Return native MCP image content plus file_path.
+
+    If native images are unsupported, call the client's read tool on file_path.
+    """
     selected = _select_paths(archive_id)
     if len(selected) != 1:
         raise ValueError("archive_id is required")
