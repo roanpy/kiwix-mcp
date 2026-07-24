@@ -25,7 +25,8 @@ MAX_TEMP_IMAGES = 16
 mcp = FastMCP(
     "kiwix",
     instructions=(
-        "Search and read local ZIM archives. Answer in the user's language; "
+        "Search and read local ZIM archives. Use list_archives to select archive_id. "
+        "Answer in the user's language; "
         "translate source text when needed, preserve proper nouns, and keep source URIs."
     ),
 )
@@ -33,6 +34,12 @@ READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
+    openWorldHint=False,
+)
+WRITES_CACHE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
     openWorldHint=False,
 )
 
@@ -92,12 +99,23 @@ def _plain_text(content: bytes, mimetype: str) -> str:
     text = content.decode("utf-8", errors="replace")
     if "html" not in mimetype.lower():
         return " ".join(text.split())
-    soup = BeautifulSoup(text, "html.parser")
+    return _soup_text(BeautifulSoup(text, "html.parser"))
+
+
+def _soup_text(soup: BeautifulSoup) -> str:
     for node in soup(["script", "style", "noscript", "svg"]):
         node.decompose()
+    for node in soup.find_all("br"):
+        node.replace_with("\n")
+    for node in soup.find_all(["th", "td"]):
+        node.insert_after("\t")
+    for node in soup.find_all(
+        ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "figcaption"]
+    ):
+        node.insert_after("\n")
     return "\n".join(
         line
-        for line in (part.strip() for part in soup.get_text("\n").splitlines())
+        for line in (" ".join(part.split()) for part in soup.get_text().splitlines())
         if line
     )
 
@@ -137,10 +155,23 @@ def _article_summary(
 @mcp.tool(annotations=READ_ONLY, structured_output=True)
 def list_archives() -> dict[str, Any]:
     """List ZIM archives in KIWIX_ARCHIVE_DIR for archive_id selection."""
-    archives = [
-        {"archive_id": name, "size_bytes": _archive_size(path)}
-        for name, path in _archive_paths().items()
-    ]
+    archives: list[dict[str, Any]] = []
+    for name, path in _archive_paths().items():
+        item: dict[str, Any] = {
+            "archive_id": name,
+            "size_bytes": _archive_size(path),
+        }
+        try:
+            archive = _archive(path)
+            for key in ("Title", "Language", "Date"):
+                try:
+                    value = archive.get_metadata(key)
+                    item[key.lower()] = bytes(value).decode("utf-8", errors="replace")
+                except (KeyError, RuntimeError):
+                    pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            item["error"] = str(exc)
+        archives.append(item)
     return {
         "status": "ok" if archives else "empty",
         "directory": str(_archive_dir()),
@@ -149,19 +180,15 @@ def list_archives() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY, structured_output=True)
-def search(query: str, archive_id: str = "", limit: int = 5) -> dict[str, Any]:
-    """Search ZIM archives; pass archive_id from list_archives to search one archive."""
+def search(query: str, archive_id: str, limit: int = 5) -> dict[str, Any]:
+    """Search one ZIM archive selected by archive_id from list_archives."""
     query = query.strip()
     if not query:
         raise ValueError("query is required")
+    if not archive_id.strip():
+        raise ValueError("archive_id is required")
     limit = min(max(int(limit), 1), 20)
     selected = _select_paths(archive_id)
-    if not selected:
-        return {
-            "status": "empty",
-            "message": f"Place .zim files in {_archive_dir()}",
-            "results": [],
-        }
 
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -218,7 +245,15 @@ def read_article(
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
         raise ValueError(f"Article is not text: {item.mimetype}")
     max_chars = min(max(int(max_chars), 1000), 50000)
-    text = _plain_text(bytes(item.content), item.mimetype)
+    content = bytes(item.content)
+    images: list[dict[str, Any]] | None = None
+    if "html" in item.mimetype.lower():
+        soup = BeautifulSoup(content.decode("utf-8", errors="replace"), "html.parser")
+        if include_images:
+            images = _find_images(soup, entry.path)
+        text = _soup_text(soup)
+    else:
+        text = _plain_text(content, item.mimetype)
     result: dict[str, Any] = {
         "status": "ok",
         "archive_id": name,
@@ -231,7 +266,7 @@ def read_article(
         "uri": f"kiwix://{name}/{entry.path}",
     }
     if include_images:
-        images = _find_images_in_article(archive, article_path)
+        images = images or []
         result["total_images"] = len(images)
         result["images"] = images
     return result
@@ -246,16 +281,22 @@ def _find_images_in_article(
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
         return []
     html = bytes(item.content).decode("utf-8", errors="replace")
-    soup = BeautifulSoup(html, "html.parser")
+    return _find_images(BeautifulSoup(html, "html.parser"), entry.path)
+
+
+def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if not src:
             continue
         try:
-            image_path = _resolve_image_path(entry.path, str(src))
+            image_path = _resolve_image_path(article_path, str(src))
         except ValueError:
             continue
+        figure = img.find_parent("figure")
+        caption = figure.find("figcaption") if figure else None
+        width, height = img.get("width"), img.get("height")
         images.append(
             {
                 "index": len(images),
@@ -263,6 +304,9 @@ def _find_images_in_article(
                 "image_path": image_path,
                 "filename": posixpath.basename(image_path),
                 "alt": str(img.get("alt", "")),
+                "caption": caption.get_text(" ", strip=True) if caption else "",
+                "width": int(width) if str(width).isdigit() else None,
+                "height": int(height) if str(height).isdigit() else None,
             }
         )
     return images
@@ -335,7 +379,7 @@ def _extract_image(archive: Archive, article_path: str, image_index: int) -> lis
     return [metadata, Image(data=raw, format=img_item.mimetype.removeprefix("image/"))]
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=False)
+@mcp.tool(annotations=WRITES_CACHE, structured_output=False)
 def extract_image(
     archive_id: str, article_path: str, image_index: int = 0
 ) -> list[Any]:

@@ -13,19 +13,19 @@ def test_empty_archive_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
-    result = server.search("test")
+    result = server.list_archives()
     assert result["status"] == "empty"
-    assert result["results"] == []
+    assert result["archives"] == []
 
 
 def test_html_cleanup_and_query_excerpt() -> None:
     content = server._plain_text(
-        b"<html><style>bad</style><body><h1>Title</h1><p>Useful answer</p><script>bad</script></body></html>",
+        b"<html><style>bad</style><body><h1>Title</h1><p>Useful <a>linked</a> answer</p><script>bad</script></body></html>",
         "text/html",
     )
-    assert content == "Title\nUseful answer"
+    assert content == "Title\nUseful linked answer"
     assert "Useful answer" in server._excerpt(
-        "x" * 1200 + content, "Useful answer", 1000
+        "x" * 1200 + "Useful answer", "Useful answer", 1000
     )
 
 
@@ -48,6 +48,24 @@ def test_zim_image_url_resolution() -> None:
         server._resolve_image_path("topic", "https://example.com/a.png")
 
 
+def test_image_metadata_uses_caption_and_dimensions() -> None:
+    soup = server.BeautifulSoup(
+        '<figure><img src="../a.jpg" width="250" height="166">'
+        "<figcaption>Useful caption</figcaption></figure>",
+        "html.parser",
+    )
+    assert server._find_images(soup, "topic/article")[0] == {
+        "index": 0,
+        "src": "../a.jpg",
+        "image_path": "a.jpg",
+        "filename": "a.jpg",
+        "alt": "",
+        "caption": "Useful caption",
+        "width": 250,
+        "height": 166,
+    }
+
+
 def test_extract_image_returns_native_mcp_content(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -58,7 +76,14 @@ def test_extract_image_returns_native_mcp_content(
         server,
         "_find_images_in_article",
         lambda archive, path: [
-            {"image_path": "image.webp", "filename": "image.webp", "alt": ""}
+            {
+                "image_path": "image.webp",
+                "filename": "image.webp",
+                "alt": "",
+                "caption": "",
+                "width": 1,
+                "height": 1,
+            }
         ],
     )
     monkeypatch.setattr(
@@ -83,3 +108,7 @@ def test_extract_image_returns_native_mcp_content(
     assert content[1].mimeType == "image/webp"
     assert next(tmp_path.iterdir()).read_bytes() == b"img"
     assert not old.exists()
+    assert (
+        server.mcp._tool_manager.get_tool("extract_image").annotations.readOnlyHint
+        is False
+    )

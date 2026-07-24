@@ -1,6 +1,6 @@
 # kiwix-mcp
 
-Local, read-only MCP server for searching and reading ZIM archives.
+Local MCP server for searching and reading ZIM archives.
 
 Place archives in:
 
@@ -16,9 +16,9 @@ Run over stdio:
 
 Tools:
 
-- `list_archives`: list selectable ZIM files from `KIWIX_ARCHIVE_DIR`.
-- `search`: full-text search when the ZIM contains an index; title fallback otherwise.
-- `read_article`: bounded text extraction plus internal image references.
+- `list_archives`: list selectable ZIM files and their title, language, and date.
+- `search`: search one selected archive using its full-text index or title fallback.
+- `read_article`: bounded, paragraph-preserving text plus internal image metadata.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
   fallback for clients such as pi. Temporary images are deduplicated and capped
   at the 16 most recently used files.
