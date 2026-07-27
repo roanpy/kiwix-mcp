@@ -66,6 +66,61 @@ def test_image_metadata_uses_caption_and_dimensions() -> None:
     }
 
 
+def test_links_prefer_see_also_and_fallback_to_body() -> None:
+    archive = SimpleNamespace(has_entry_by_path=lambda path: True)
+    soup = server.BeautifulSoup(
+        '<p><a href="body">Body</a></p><h2 id="See_also">See also</h2>'
+        '<ul><li><a href="related">Related</a></li></ul><h2>References</h2>',
+        "html.parser",
+    )
+    see_also, links = server._find_links(archive, soup, "article")
+    assert see_also == [{"article_path": "related", "title": "Related"}]
+    assert links == []
+
+    see_also, links = server._find_links(
+        archive,
+        server.BeautifulSoup('<a href="body">Body</a>', "html.parser"),
+        "article",
+    )
+    assert see_also == []
+    assert links == [{"article_path": "body", "title": "Body"}]
+
+
+def test_search_pagination_keeps_exact_title_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: True,
+        get_entry_by_title=lambda query: SimpleNamespace(path="exact"),
+    )
+    search_result = SimpleNamespace(
+        getResults=lambda start, limit: ["other-1", "exact", "other-2", "other-3"]
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: search_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    first = server.search("Exact", "test.zim", limit=2)
+    second = server.search("Exact", "test.zim", limit=2, offset=2)
+    assert [item["article_path"] for item in first["results"]] == ["exact", "other-1"]
+    assert [item["article_path"] for item in second["results"]] == [
+        "other-2",
+        "other-3",
+    ]
+
+
 def test_extract_image_returns_native_mcp_content(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

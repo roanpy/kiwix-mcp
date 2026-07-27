@@ -25,7 +25,10 @@ MAX_TEMP_IMAGES = 16
 mcp = FastMCP(
     "kiwix",
     instructions=(
-        "Search and read local ZIM archives. Use list_archives to select archive_id. "
+        "Search and read local ZIM archives. Use list_archives and choose archive_id "
+        "by language and collection: prefer full archives for coverage and maxi archives "
+        "when images matter; use title, date, and description to break ties. "
+        "Ask only when the user's goal leaves the choice ambiguous. "
         "Answer in the user's language; "
         "translate source text when needed, preserve proper nouns, and keep source URIs."
     ),
@@ -163,7 +166,9 @@ def list_archives() -> dict[str, Any]:
         }
         try:
             archive = _archive(path)
-            for key in ("Title", "Language", "Date"):
+            item["article_count"] = archive.article_count
+            item["media_count"] = archive.media_count
+            for key in ("Title", "Language", "Date", "Description"):
                 try:
                     value = archive.get_metadata(key)
                     item[key.lower()] = bytes(value).decode("utf-8", errors="replace")
@@ -180,14 +185,17 @@ def list_archives() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY, structured_output=True)
-def search(query: str, archive_id: str, limit: int = 5) -> dict[str, Any]:
-    """Search one ZIM archive selected by archive_id from list_archives."""
+def search(
+    query: str, archive_id: str, limit: int = 5, offset: int = 0
+) -> dict[str, Any]:
+    """Search one selected ZIM archive; use offset to fetch the next page."""
     query = query.strip()
     if not query:
         raise ValueError("query is required")
     if not archive_id.strip():
         raise ValueError("archive_id is required")
     limit = min(max(int(limit), 1), 20)
+    offset = min(max(int(offset), 0), 1000)
     selected = _select_paths(archive_id)
 
     results: list[dict[str, Any]] = []
@@ -199,18 +207,25 @@ def search(query: str, archive_id: str, limit: int = 5) -> dict[str, Any]:
             archive = _archive(path)
             remaining = limit - len(results)
             if archive.has_fulltext_index:
-                found = (
-                    Searcher(archive)
-                    .search(Query().set_query(query))
-                    .getResults(0, remaining)
-                )
+                search_result = Searcher(archive).search(Query().set_query(query))
                 mode = "fulltext"
             else:
-                found = (
-                    SuggestionSearcher(archive).suggest(query).getResults(0, remaining)
-                )
+                search_result = SuggestionSearcher(archive).suggest(query)
                 mode = "title"
-            for article_path in found:
+            exact_path = (
+                archive.get_entry_by_title(query).path
+                if archive.has_entry_by_title(query)
+                else None
+            )
+            found = search_result.getResults(0, offset + remaining + 1)
+            article_paths = ([exact_path] if exact_path else []) + [
+                str(article_path)
+                for article_path in found
+                if str(article_path) != exact_path
+            ]
+            for article_path in article_paths[offset : offset + remaining]:
+                if len(results) >= limit:
+                    break
                 item = _article_summary(archive, name, str(article_path), query)
                 item["search_mode"] = mode
                 results.append(item)
@@ -219,6 +234,8 @@ def search(query: str, archive_id: str, limit: int = 5) -> dict[str, Any]:
     return {
         "status": "ok" if results else "no_hits",
         "query": query,
+        "offset": offset,
+        "next_offset": offset + len(results) if len(results) == limit else None,
         "results": results,
         "errors": errors,
     }
@@ -231,8 +248,9 @@ def read_article(
     query: str = "",
     max_chars: int = 12000,
     include_images: bool = True,
+    include_links: bool = True,
 ) -> dict[str, Any]:
-    """Read article text. include_images=True 时附带文章中的图片列表。"""
+    """Read article text. include_images/include_links 时附带图片列表和条目链接。"""
     selected = _select_paths(archive_id)
     if len(selected) != 1:
         raise ValueError("archive_id is required")
@@ -247,10 +265,14 @@ def read_article(
     max_chars = min(max(int(max_chars), 1000), 50000)
     content = bytes(item.content)
     images: list[dict[str, Any]] | None = None
+    see_also: list[dict[str, Any]] | None = None
+    links: list[dict[str, Any]] | None = None
     if "html" in item.mimetype.lower():
         soup = BeautifulSoup(content.decode("utf-8", errors="replace"), "html.parser")
         if include_images:
             images = _find_images(soup, entry.path)
+        if include_links:
+            see_also, links = _find_links(archive, soup, entry.path)
         text = _soup_text(soup)
     else:
         text = _plain_text(content, item.mimetype)
@@ -269,7 +291,68 @@ def read_article(
         images = images or []
         result["total_images"] = len(images)
         result["images"] = images
+    if include_links:
+        see_also = see_also or []
+        links = links or []
+        result["see_also"] = see_also
+        result["links"] = links
+        result["total_links"] = len(see_also) + len(links)
     return result
+
+
+MAX_SEE_ALSO_LINKS = 10
+MAX_BODY_LINKS = 15
+_SEE_ALSO_LABELS = {"see also", "参见", "參見"}
+
+
+def _find_links(
+    archive: Archive, soup: BeautifulSoup, article_path: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract internal article links: curated See-also section first, then body links.
+
+    Returns (see_also, links); each item is {article_path, title} with
+    article_path verified to exist and directly usable with read_article.
+    """
+    see_also: list[dict[str, Any]] = []
+    body: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(anchor, target: list[dict[str, Any]], cap: int) -> None:
+        if len(target) >= cap:
+            return
+        try:
+            path = _resolve_image_path(article_path, str(anchor["href"]))
+        except (KeyError, ValueError):
+            return
+        if path in seen:
+            return
+        try:
+            if not archive.has_entry_by_path(path):
+                return
+        except RuntimeError:
+            return
+        seen.add(path)
+        target.append({"article_path": path, "title": anchor.get_text(" ", strip=True)})
+
+    for h2 in soup.find_all("h2"):
+        label = (h2.get("id") or "").replace("_", " ").strip().lower()
+        if not label:
+            label = h2.get_text(" ", strip=True).lower()
+        if label in _SEE_ALSO_LABELS:
+            for tag in h2.find_all_next():
+                if tag.name == "h2":
+                    break
+                if tag.name == "a" and tag.get("href"):
+                    add(tag, see_also, MAX_SEE_ALSO_LINKS)
+            break
+
+    if not see_also:
+        for anchor in soup.find_all("a", href=True):
+            if len(body) >= MAX_BODY_LINKS:
+                break
+            add(anchor, body, MAX_BODY_LINKS)
+
+    return see_also, body
 
 
 def _find_images_in_article(

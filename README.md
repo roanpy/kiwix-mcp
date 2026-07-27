@@ -16,9 +16,9 @@ Run over stdio:
 
 Tools:
 
-- `list_archives`: list selectable ZIM files and their title, language, and date.
-- `search`: search one selected archive using its full-text index or title fallback.
-- `read_article`: bounded, paragraph-preserving text plus internal image metadata.
+- `list_archives`: list ZIM metadata used by the agent to choose the best archive.
+- `search`: search one selected archive with exact-title priority and pagination.
+- `read_article`: bounded text plus image metadata and concise related links.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
   fallback for clients such as pi. Temporary images are deduplicated and capped
   at the 16 most recently used files.
