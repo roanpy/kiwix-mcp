@@ -1,37 +1,54 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import inspect
+import json
+import logging
 import mimetypes
 import os
 import posixpath
 import sys
 import tempfile
 from functools import lru_cache
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup
 from libzim import Archive, Query, Searcher, SuggestionSearcher
-from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import ToolAnnotations
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import (
+    CallToolResult,
+    ImageContent,
+    ListToolsResult,
+    TextContent,
+    Tool,
+    ToolAnnotations,
+)
 
 DEFAULT_ARCHIVE_DIR = Path("/Users/peter/.chroma_db/kiwix/archives")
 IMAGE_TEMP_DIR = Path(tempfile.gettempdir()) / "kiwix-mcp"
 MAX_ARTICLE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TEMP_IMAGES = 16
+MAX_IMAGE_REFERENCES = 30
+MAX_LOG_BYTES = 1 * 1024 * 1024
+LOG_BACKUP_COUNT = 2
 
-mcp = FastMCP(
-    "kiwix",
-    instructions=(
-        "Search and read local ZIM archives. Use list_archives and choose archive_id "
-        "by language and collection: prefer full archives for coverage and maxi archives "
-        "when images matter; use title, date, and description to break ties. "
-        "Ask only when the user's goal leaves the choice ambiguous. "
-        "Answer in the user's language; "
-        "translate source text when needed, preserve proper nouns, and keep source URIs."
-    ),
+_LOGGER = logging.getLogger("kiwix-mcp")
+
+MCP_INSTRUCTIONS = (
+    "Search and read local ZIM archives. Use list_archives and choose archive_id "
+    "by language and collection: prefer full archives for coverage and maxi archives "
+    "when images matter; use title, date, and description to break ties. "
+    "For images, inspect read_article metadata and prefer image_path over index 0. "
+    "For cross-archive comparison, call search with archive_id='*'. "
+    "Ask only when the user's goal leaves the choice ambiguous. "
+    "Answer in the user's language; "
+    "translate source text when needed, preserve proper nouns, and keep source URIs."
 )
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -49,6 +66,30 @@ WRITES_CACHE = ToolAnnotations(
 
 def _archive_dir() -> Path:
     return Path(os.environ.get("KIWIX_ARCHIVE_DIR", DEFAULT_ARCHIVE_DIR)).expanduser()
+
+
+def _configure_logging() -> None:
+    """Enable diagnostics only when explicitly requested via environment."""
+    log_file = os.environ.get("KIWIX_MCP_LOG_FILE", "").strip()
+    log_level = os.environ.get("KIWIX_MCP_LOG_LEVEL", "").strip().upper()
+    if not log_file and not log_level:
+        return
+    level = getattr(logging, log_level or "INFO", logging.INFO)
+    if not isinstance(level, int):
+        level = logging.INFO
+    if log_file:
+        path = Path(log_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = RotatingFileHandler(
+            path, maxBytes=MAX_LOG_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+        )
+    else:
+        handler = logging.StreamHandler(sys.stderr)
+    logging.basicConfig(
+        level=level,
+        handlers=[handler],
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
 def _archive_paths() -> dict[str, Path]:
@@ -77,7 +118,7 @@ def _select_paths(archive_id: str) -> list[tuple[str, Path]]:
     raise ValueError(f"Unknown archive: {archive_id}")
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _open_archive(path: str, mtime_ns: int) -> Archive:
     del mtime_ns
     return Archive(Path(path))
@@ -135,6 +176,21 @@ def _excerpt(text: str, query: str, max_chars: int) -> str:
     return text[start:end].strip()
 
 
+def _article_window(
+    text: str, query: str, max_chars: int, offset: int
+) -> tuple[str, int, int | None]:
+    """Return a query-centered first window or an exact continuation window."""
+    start = max(int(offset), 0)
+    if start == 0:
+        needle = query.strip().casefold()
+        position = text.casefold().find(needle) if needle else -1
+        if position >= 0:
+            start = max(0, position - max_chars // 3)
+    start = min(start, len(text))
+    end = min(len(text), start + max_chars)
+    return text[start:end], start, end if end < len(text) else None
+
+
 def _article_summary(
     archive: Archive, archive_id: str, article_path: str, query: str
 ) -> dict[str, Any]:
@@ -155,7 +211,6 @@ def _article_summary(
     }
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def list_archives() -> dict[str, Any]:
     """List ZIM archives in KIWIX_ARCHIVE_DIR for archive_id selection."""
     archives: list[dict[str, Any]] = []
@@ -168,7 +223,17 @@ def list_archives() -> dict[str, Any]:
             archive = _archive(path)
             item["article_count"] = archive.article_count
             item["media_count"] = archive.media_count
-            for key in ("Title", "Language", "Date", "Description"):
+            item["has_fulltext_index"] = archive.has_fulltext_index
+            item["has_title_index"] = archive.has_title_index
+            for key in (
+                "Title",
+                "Language",
+                "Date",
+                "Description",
+                "Name",
+                "Tags",
+                "Flavour",
+            ):
                 try:
                     value = archive.get_metadata(key)
                     item[key.lower()] = bytes(value).decode("utf-8", errors="replace")
@@ -184,11 +249,10 @@ def list_archives() -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def search(
     query: str, archive_id: str, limit: int = 5, offset: int = 0
 ) -> dict[str, Any]:
-    """Search one selected ZIM archive; use offset to fetch the next page."""
+    """Search one archive, or all archives with archive_id='*'."""
     query = query.strip()
     if not query:
         raise ValueError("query is required")
@@ -196,16 +260,18 @@ def search(
         raise ValueError("archive_id is required")
     limit = min(max(int(limit), 1), 20)
     offset = min(max(int(offset), 0), 1000)
-    selected = _select_paths(archive_id)
+    selected = (
+        _select_paths("") if archive_id.strip() == "*" else _select_paths(archive_id)
+    )
 
-    results: list[dict[str, Any]] = []
+    exact_matches: list[tuple[Archive, str, str, str]] = []
+    other_matches: list[tuple[Archive, str, str, str]] = []
     errors: list[dict[str, str]] = []
+    estimated_matches = 0
+    estimated_known = False
     for name, path in selected:
-        if len(results) >= limit:
-            break
         try:
             archive = _archive(path)
-            remaining = limit - len(results)
             if archive.has_fulltext_index:
                 search_result = Searcher(archive).search(Query().set_query(query))
                 mode = "fulltext"
@@ -217,38 +283,60 @@ def search(
                 if archive.has_entry_by_title(query)
                 else None
             )
-            found = search_result.getResults(0, offset + remaining + 1)
-            article_paths = ([exact_path] if exact_path else []) + [
-                str(article_path)
-                for article_path in found
-                if str(article_path) != exact_path
-            ]
-            for article_path in article_paths[offset : offset + remaining]:
-                if len(results) >= limit:
-                    break
-                item = _article_summary(archive, name, str(article_path), query)
-                item["search_mode"] = mode
-                results.append(item)
+            estimate = search_result.getEstimatedMatches()
+            if estimate is not None:
+                estimated_matches += int(estimate)
+                estimated_known = True
+            found = search_result.getResults(0, offset + limit + 1)
+            seen: set[str] = set()
+            if exact_path:
+                exact_matches.append((archive, name, str(exact_path), "exact_title"))
+                seen.add(str(exact_path))
+            for article_path in found:
+                article_path = str(article_path)
+                if article_path in seen:
+                    continue
+                seen.add(article_path)
+                other_matches.append((archive, name, article_path, mode))
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append({"archive_id": name, "error": str(exc)})
+    matches = exact_matches + other_matches
+    page_matches = matches[offset : offset + limit]
+    results: list[dict[str, Any]] = []
+    for archive, name, article_path, match_type in page_matches:
+        try:
+            item = _article_summary(archive, name, article_path, query)
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append({"archive_id": name, "error": str(exc)})
+            continue
+        item["search_mode"] = (
+            "fulltext" if match_type in {"exact_title", "fulltext"} else "title"
+        )
+        item["match_type"] = match_type
+        results.append(item)
+    has_more = len(matches) > offset + len(page_matches)
     return {
         "status": "ok" if results else "no_hits",
         "query": query,
         "offset": offset,
-        "next_offset": offset + len(results) if len(results) == limit else None,
+        "next_offset": offset + len(page_matches)
+        if has_more and page_matches
+        else None,
+        "estimated_matches": estimated_matches if estimated_known else None,
         "results": results,
         "errors": errors,
     }
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def read_article(
     archive_id: str,
     article_path: str,
     query: str = "",
     max_chars: int = 12000,
+    offset: int = 0,
     include_images: bool = True,
     include_links: bool = True,
+    image_offset: int = 0,
 ) -> dict[str, Any]:
     """Read article text. include_images/include_links 时附带图片列表和条目链接。"""
     selected = _select_paths(archive_id)
@@ -263,6 +351,7 @@ def read_article(
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
         raise ValueError(f"Article is not text: {item.mimetype}")
     max_chars = min(max(int(max_chars), 1000), 50000)
+    offset = max(int(offset), 0)
     content = bytes(item.content)
     images: list[dict[str, Any]] | None = None
     see_also: list[dict[str, Any]] | None = None
@@ -276,21 +365,34 @@ def read_article(
         text = _soup_text(soup)
     else:
         text = _plain_text(content, item.mimetype)
+    window, text_offset, next_offset = _article_window(text, query, max_chars, offset)
     result: dict[str, Any] = {
         "status": "ok",
         "archive_id": name,
         "article_path": entry.path,
         "title": entry.title or item.title,
         "mimetype": item.mimetype,
-        "text": _excerpt(text, query, max_chars),
-        "truncated": len(text) > max_chars,
+        "text": window,
+        "offset": text_offset,
+        "next_offset": next_offset,
+        "truncated": next_offset is not None,
         "total_chars": len(text),
         "uri": f"kiwix://{name}/{entry.path}",
     }
     if include_images:
         images = images or []
+        image_offset = min(max(int(image_offset), 0), len(images))
+        image_page = images[image_offset : image_offset + MAX_IMAGE_REFERENCES]
+        next_image_offset = (
+            image_offset + len(image_page)
+            if image_offset + len(image_page) < len(images)
+            else None
+        )
         result["total_images"] = len(images)
-        result["images"] = images
+        result["image_offset"] = image_offset
+        result["images"] = image_page
+        result["next_image_offset"] = next_image_offset
+        result["images_truncated"] = next_image_offset is not None
     if include_links:
         see_also = see_also or []
         links = links or []
@@ -454,17 +556,27 @@ def _extract_image(archive: Archive, article_path: str, image_index: int) -> lis
         "mimetype": img_item.mimetype,
         "size_bytes": img_item.size,
         "image_index": image_index,
+        "image_path": img_info["image_path"],
         "total_images": len(images),
         "alt": img_info["alt"],
         "filename": img_info["filename"],
         "article_path": article_path,
     }
-    return [metadata, Image(data=raw, format=img_item.mimetype.removeprefix("image/"))]
+    return [
+        metadata,
+        ImageContent(
+            type="image",
+            data=base64.b64encode(raw).decode("ascii"),
+            mimeType=img_item.mimetype,
+        ),
+    ]
 
 
-@mcp.tool(annotations=WRITES_CACHE, structured_output=False)
 def extract_image(
-    archive_id: str, article_path: str, image_index: int = 0
+    archive_id: str,
+    article_path: str,
+    image_index: int = 0,
+    image_path: str | None = None,
 ) -> list[Any]:
     """Return native MCP image content plus file_path.
 
@@ -475,7 +587,241 @@ def extract_image(
         raise ValueError("archive_id is required")
     _, path = selected[0]
     archive = _archive(path)
+    if image_path is not None:
+        images = _find_images_in_article(archive, article_path)
+        requested_path = posixpath.normpath(unquote(image_path).lstrip("/"))
+        image_index = next(
+            (
+                index
+                for index, image in enumerate(images)
+                if image["image_path"] == requested_path
+            ),
+            -1,
+        )
+        if image_index < 0:
+            raise ValueError(f"Image path not found in article: {image_path}")
     return _extract_image(archive, article_path, image_index)
+
+
+_TOOL_DEFINITIONS = [
+    Tool(
+        name="list_archives",
+        title="List ZIM archives",
+        description="List ZIM archives and metadata, including flavour, for archive selection.",
+        inputSchema={"type": "object", "properties": {}},
+        outputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "directory": {"type": "string"},
+                "archives": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "archive_id": {"type": "string"},
+                            "flavour": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "required": ["status", "directory", "archives"],
+        },
+        annotations=READ_ONLY,
+    ),
+    Tool(
+        name="search",
+        title="Search a ZIM archive",
+        description="Search one selected ZIM archive with exact-title priority, pagination, and match types; use archive_id='*' to aggregate all archives.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "archive_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 1000},
+            },
+            "required": ["query", "archive_id"],
+        },
+        outputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "query": {"type": "string"},
+                "offset": {"type": "integer"},
+                "next_offset": {"type": ["integer", "null"]},
+                "estimated_matches": {"type": ["integer", "null"]},
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "archive_id": {"type": "string"},
+                            "article_path": {"type": "string"},
+                            "title": {"type": "string"},
+                            "mimetype": {"type": "string"},
+                            "snippet": {"type": "string"},
+                            "uri": {"type": "string"},
+                            "search_mode": {
+                                "type": "string",
+                                "enum": ["fulltext", "title"],
+                            },
+                            "match_type": {
+                                "type": "string",
+                                "enum": ["exact_title", "fulltext", "title"],
+                            },
+                        },
+                    },
+                },
+                "errors": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["status", "query", "offset", "results", "errors"],
+        },
+        annotations=READ_ONLY,
+    ),
+    Tool(
+        name="read_article",
+        title="Read a ZIM article",
+        description="Read bounded article text with optional image metadata and related links.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "archive_id": {"type": "string"},
+                "article_path": {"type": "string"},
+                "query": {"type": "string"},
+                "max_chars": {"type": "integer", "minimum": 1000, "maximum": 50000},
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Continue from a previous next_offset; query only centers the first window.",
+                },
+                "include_images": {"type": "boolean"},
+                "include_links": {"type": "boolean"},
+                "image_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Continue image metadata from a previous next_image_offset; page size is capped at 30.",
+                },
+            },
+            "required": ["archive_id", "article_path"],
+        },
+        outputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "archive_id": {"type": "string"},
+                "article_path": {"type": "string"},
+                "title": {"type": "string"},
+                "text": {"type": "string"},
+                "offset": {"type": "integer"},
+                "next_offset": {"type": ["integer", "null"]},
+                "truncated": {"type": "boolean"},
+                "total_chars": {"type": "integer"},
+                "uri": {"type": "string"},
+                "total_images": {"type": "integer"},
+                "image_offset": {"type": "integer"},
+                "next_image_offset": {"type": ["integer", "null"]},
+            },
+            "required": [
+                "status",
+                "archive_id",
+                "article_path",
+                "title",
+                "text",
+                "offset",
+                "truncated",
+                "total_chars",
+                "uri",
+            ],
+        },
+        annotations=READ_ONLY,
+    ),
+    Tool(
+        name="extract_image",
+        title="Extract a ZIM image",
+        description="Return a ZIM image as native MCP image content and a temporary file fallback; prefer image_path from read_article over the index-0 fallback.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "archive_id": {"type": "string"},
+                "article_path": {"type": "string"},
+                "image_index": {"type": "integer", "minimum": 0},
+                "image_path": {
+                    "type": "string",
+                    "description": "Choose an exact image_path returned by read_article; overrides image_index.",
+                },
+            },
+            "required": ["archive_id", "article_path"],
+        },
+        annotations=WRITES_CACHE,
+    ),
+]
+
+
+def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
+    _LOGGER.info("tool=%s", name)
+    if name == "list_archives":
+        return list_archives()
+    if name == "search":
+        return search(**arguments)
+    if name == "read_article":
+        return read_article(**arguments)
+    if name == "extract_image":
+        return extract_image(**arguments)
+    raise ValueError(f"Unknown tool: {name}")
+
+
+def _json_content(value: Any) -> TextContent:
+    return TextContent(type="text", text=json.dumps(value, ensure_ascii=False))
+
+
+def _mcp_result(value: Any) -> CallToolResult:
+    if isinstance(value, dict):
+        return CallToolResult(content=[_json_content(value)], structuredContent=value)
+    content: list[Any] = []
+    for item in value:
+        content.append(_json_content(item) if isinstance(item, dict) else item)
+    return CallToolResult(content=content)
+
+
+def _legacy_result(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    return [_json_content(item) if isinstance(item, dict) else item for item in value]
+
+
+async def _list_tools_v2(_ctx: Any, _params: Any) -> ListToolsResult:
+    return ListToolsResult(tools=_TOOL_DEFINITIONS)
+
+
+async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
+    try:
+        return _mcp_result(_dispatch_tool(params.name, params.arguments or {}))
+    except Exception as exc:
+        _LOGGER.warning("tool=%s failed: %s", params.name, exc)
+        return CallToolResult(
+            content=[TextContent(type="text", text=str(exc))], isError=True
+        )
+
+
+if "on_list_tools" in inspect.signature(Server).parameters:
+    mcp = Server(
+        "kiwix",
+        version="0.1.0",
+        instructions=MCP_INSTRUCTIONS,
+        on_list_tools=_list_tools_v2,
+        on_call_tool=_call_tool_v2,
+    )
+else:
+    mcp = Server("kiwix", instructions=MCP_INSTRUCTIONS)
+
+    @mcp.list_tools()
+    async def _list_tools_v1() -> list[Tool]:
+        return _TOOL_DEFINITIONS
+
+    @mcp.call_tool()
+    async def _call_tool_v1(name: str, arguments: dict[str, Any]) -> Any:
+        return _legacy_result(_dispatch_tool(name, arguments or {}))
 
 
 if __name__ == "__main__":
@@ -484,4 +830,13 @@ if __name__ == "__main__":
     protocol_stdout = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = protocol_stdout
-    mcp.run(transport="stdio")
+    _configure_logging()
+    import asyncio
+
+    async def _run() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await mcp.run(
+                read_stream, write_stream, mcp.create_initialization_options()
+            )
+
+    asyncio.run(_run())
