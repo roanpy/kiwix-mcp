@@ -5,7 +5,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
   "beautifulsoup4>=4.13,<5",
   "libzim>=3.12,<4",
-  "mcp>=1.20,<2",
+  "mcp>=2,<3",
 ]
 
 [dependency-groups]

@@ -18,6 +18,30 @@ def test_empty_archive_directory(
     assert result["archives"] == []
 
 
+def test_list_archives_exposes_zim_flavour(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    archive = SimpleNamespace(
+        article_count=10,
+        media_count=20,
+        has_fulltext_index=True,
+        has_title_index=True,
+        get_metadata=lambda key: {
+            "Title": b"Test",
+            "Flavour": b"maxi",
+        }[key],
+    )
+    path = tmp_path / "test.zim"
+    path.write_bytes(b"zim")
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+
+    result = server.list_archives()
+
+    assert result["archives"][0]["title"] == "Test"
+    assert result["archives"][0]["flavour"] == "maxi"
+
+
 def test_html_cleanup_and_query_excerpt() -> None:
     content = server._plain_text(
         b"<html><style>bad</style><body><h1>Title</h1><p>Useful <a>linked</a> answer</p><script>bad</script></body></html>",
@@ -29,12 +53,78 @@ def test_html_cleanup_and_query_excerpt() -> None:
     )
 
 
+def test_article_window_supports_query_and_continuation() -> None:
+    text = "a" * 1200 + "needle" + "b" * 1200
+    first, offset, next_offset = server._article_window(text, "needle", 1000, 0)
+    assert "needle" in first
+    assert offset > 0
+    assert next_offset is not None
+
+    second, second_offset, _ = server._article_window(text, "", 1000, next_offset)
+    assert second_offset == next_offset
+    assert second == text[next_offset : next_offset + 1000]
+
+
+def test_read_article_is_not_truncated_when_query_window_contains_all_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "a" * 900 + "needle" + "b" * 94
+    item = SimpleNamespace(
+        size=len(text), mimetype="text/plain", content=text.encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    result = server.read_article(
+        "test.zim",
+        "article",
+        query="needle",
+        max_chars=1000,
+        include_images=False,
+        include_links=False,
+    )
+
+    assert result["next_offset"] is None
+    assert result["truncated"] is False
+    assert result["text"] == text[567:]
+
+
 def test_archive_selection_rejects_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
     with pytest.raises(ValueError, match="Unknown archive"):
         server._select_paths("missing.zim")
+
+
+def test_mcp_tool_registry_is_stable() -> None:
+    result = asyncio.run(server._list_tools_v2(None, None))
+    assert [tool.name for tool in result.tools] == [
+        "list_archives",
+        "search",
+        "read_article",
+        "extract_image",
+    ]
+    assert result.tools[0].output_schema is not None
+    assert (
+        "flavour"
+        in result.tools[0].output_schema["properties"]["archives"]["items"][
+            "properties"
+        ]
+    )
+    assert (
+        "match_type"
+        in result.tools[1].output_schema["properties"]["results"]["items"]["properties"]
+    )
+    assert "offset" in result.tools[2].input_schema["properties"]
+    assert "image_offset" in result.tools[2].input_schema["properties"]
+    assert "image_path" in result.tools[3].input_schema["properties"]
 
 
 def test_zim_image_url_resolution() -> None:
@@ -94,8 +184,10 @@ def test_search_pagination_keeps_exact_title_first(
         has_entry_by_title=lambda query: True,
         get_entry_by_title=lambda query: SimpleNamespace(path="exact"),
     )
+    paths = ["other-1", "exact", "other-2", "other-3"]
     search_result = SimpleNamespace(
-        getResults=lambda start, limit: ["other-1", "exact", "other-2", "other-3"]
+        getResults=lambda start, limit: paths[start : start + limit],
+        getEstimatedMatches=lambda: len(paths),
     )
     monkeypatch.setattr(
         server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
@@ -115,10 +207,111 @@ def test_search_pagination_keeps_exact_title_first(
     first = server.search("Exact", "test.zim", limit=2)
     second = server.search("Exact", "test.zim", limit=2, offset=2)
     assert [item["article_path"] for item in first["results"]] == ["exact", "other-1"]
+    assert [item["match_type"] for item in first["results"]] == [
+        "exact_title",
+        "fulltext",
+    ]
     assert [item["article_path"] for item in second["results"]] == [
         "other-2",
         "other-3",
     ]
+    assert [item["match_type"] for item in second["results"]] == [
+        "fulltext",
+        "fulltext",
+    ]
+    assert first["next_offset"] == 2
+    assert second["next_offset"] is None
+    assert second["estimated_matches"] == 4
+
+
+def test_search_can_aggregate_all_archives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="first",
+    )
+    second = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="second",
+    )
+    results = {
+        "first": ["a", "b"],
+        "second": ["c", "d"],
+    }
+    monkeypatch.setattr(
+        server,
+        "_select_paths",
+        lambda archive_id: [
+            ("first.zim", Path("first.zim")),
+            ("second.zim", Path("second.zim")),
+        ],
+    )
+    monkeypatch.setattr(
+        server, "_archive", lambda path: first if path.name == "first.zim" else second
+    )
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: results[archive.name][
+                    start : start + limit
+                ],
+                getEstimatedMatches=lambda: len(results[archive.name]),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {
+            "archive_id": archive_id,
+            "article_path": article_path,
+        },
+    )
+
+    result = server.search("query", "*", limit=3)
+
+    assert [item["article_path"] for item in result["results"]] == ["a", "b", "c"]
+    assert [item["archive_id"] for item in result["results"]] == [
+        "first.zim",
+        "first.zim",
+        "second.zim",
+    ]
+    assert result["estimated_matches"] == 4
+    assert result["next_offset"] == 3
+
+
+def test_read_article_caps_image_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = "".join(f'<img src="/{index}.png">' for index in range(31))
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html.encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    result = server.read_article("test.zim", "article", include_links=False)
+    assert result["total_images"] == 31
+    assert len(result["images"]) == server.MAX_IMAGE_REFERENCES
+    assert result["images_truncated"] is True
+
+    next_page = server.read_article(
+        "test.zim", "article", include_links=False, image_offset=30
+    )
+    assert next_page["image_offset"] == 30
+    assert len(next_page["images"]) == 1
+    assert next_page["next_image_offset"] is None
 
 
 def test_extract_image_returns_native_mcp_content(
@@ -151,19 +344,27 @@ def test_extract_image_returns_native_mcp_content(
     old.write_bytes(b"old")
     os.utime(old, ns=(1, 1))
 
-    content = asyncio.run(
-        server.mcp._tool_manager.call_tool(
-            "extract_image",
-            {"archive_id": "test.zim", "article_path": "article"},
-            convert_result=True,
+    result = asyncio.run(
+        server._call_tool_v2(
+            None,
+            SimpleNamespace(
+                name="extract_image",
+                arguments={
+                    "archive_id": "test.zim",
+                    "article_path": "article",
+                    "image_path": "image.webp",
+                },
+            ),
         )
     )
-    assert isinstance(content[0], TextContent)
-    assert isinstance(content[1], ImageContent)
-    assert content[1].mimeType == "image/webp"
+    assert isinstance(result.content[0], TextContent)
+    assert isinstance(result.content[1], ImageContent)
+    assert result.content[1].model_dump(by_alias=True)["mimeType"] == "image/webp"
     assert next(tmp_path.iterdir()).read_bytes() == b"img"
     assert not old.exists()
     assert (
-        server.mcp._tool_manager.get_tool("extract_image").annotations.readOnlyHint
+        server._TOOL_DEFINITIONS[-1].annotations.model_dump(by_alias=True)[
+            "readOnlyHint"
+        ]
         is False
     )
