@@ -213,6 +213,8 @@ def test_resource_read_returns_clean_text(
         )
     )
     assert result.contents[0].text == "Hello World"
+    assert result.meta["archive_id"] == "test.zim"
+    assert result.contents[0].meta["truncated"] is False
 
 
 def test_read_resource_follows_main_entry_redirect(
