@@ -283,6 +283,7 @@ def test_image_metadata_uses_caption_and_dimensions() -> None:
         "caption": "Useful caption",
         "width": 250,
         "height": 166,
+        "is_main": True,
     }
 
 
@@ -336,6 +337,223 @@ def test_article_uri_round_trip() -> None:
     archive_id, article_path = server._parse_article_uri(uri)
     assert archive_id == "zh_all.zim"
     assert article_path == "Science/Topic A"
+
+
+def test_article_uri_round_trip_special_chars() -> None:
+    for archive_id, article_path in [
+        ("zh_all.zim", "Wikipedia:首页"),
+        ("en_all.zim", "Topic/子 标题"),
+        ("a:b.zim", "path/with spaces"),
+    ]:
+        uri = server._article_uri(archive_id, article_path)
+        parsed_id, parsed_path = server._parse_article_uri(uri)
+        assert parsed_id == archive_id
+        assert parsed_path == article_path
+
+
+def test_search_fulltext_mode_returns_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+    )
+    search_result = SimpleNamespace(
+        getResults=lambda start, limit: ["a", "b"],
+        getEstimatedMatches=lambda: 2,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: search_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("query", "test.zim", mode="fulltext")
+    assert result["mode"] == "fulltext"
+    assert [item["match_type"] for item in result["results"]] == [
+        "fulltext",
+        "fulltext",
+    ]
+
+
+def test_search_title_mode_forces_suggestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+    )
+    suggestion_result = SimpleNamespace(
+        getResults=lambda start, limit: ["suggested"],
+        getEstimatedMatches=lambda: 1,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda archive: SimpleNamespace(suggest=lambda query: suggestion_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("query", "test.zim", mode="title")
+    assert result["mode"] == "title"
+    assert result["results"][0]["match_type"] == "title"
+
+
+def test_search_cross_archive_with_fulltext_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="first",
+        get_metadata=lambda key: b"en" if key == "Language" else b"",
+    )
+    second = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="second",
+        get_metadata=lambda key: b"zh" if key == "Language" else b"",
+    )
+    results = {"first": ["a"], "second": ["c"]}
+    monkeypatch.setattr(
+        server,
+        "_select_paths",
+        lambda archive_id: [
+            ("first.zim", Path("first.zim")),
+            ("second.zim", Path("second.zim")),
+        ],
+    )
+    monkeypatch.setattr(
+        server, "_archive", lambda path: first if path.name == "first.zim" else second
+    )
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: results[archive.name][
+                    start : start + limit
+                ],
+                getEstimatedMatches=lambda: len(results[archive.name]),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {
+            "archive_id": archive_id,
+            "article_path": article_path,
+        },
+    )
+
+    result = server.search("query", "*", mode="fulltext", limit=2)
+    assert result["mode"] == "fulltext"
+    assert [item["article_path"] for item in result["results"]] == ["a", "c"]
+
+
+def test_search_cross_archive_filters_by_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="first",
+        get_metadata=lambda key: b"eng" if key == "Language" else b"",
+    )
+    second = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="second",
+        get_metadata=lambda key: b"zho" if key == "Language" else b"",
+    )
+    monkeypatch.setattr(
+        server,
+        "_select_paths",
+        lambda archive_id: [
+            ("first.zim", Path("first.zim")),
+            ("second.zim", Path("second.zim")),
+        ],
+    )
+    monkeypatch.setattr(
+        server, "_archive", lambda path: first if path.name == "first.zim" else second
+    )
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: [archive.name],
+                getEstimatedMatches=lambda: 1,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"archive_id": archive_id},
+    )
+
+    # two-letter alias "zh" maps to ZIM's "zho"
+    result = server.search("query", "*", language="zh")
+    assert [item["archive_id"] for item in result["results"]] == ["second.zim"]
+    assert result["filters"]["language"] == "zh"
+
+    # three-letter code matches directly
+    result = server.search("query", "*", language="eng")
+    assert [item["archive_id"] for item in result["results"]] == ["first.zim"]
+
+    # unknown language matches nothing
+    result = server.search("query", "*", language="xx")
+    assert result["results"] == []
+
+
+def test_search_single_archive_ignores_language_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        get_metadata=lambda key: b"en" if key == "Language" else b"",
+    )
+    search_result = SimpleNamespace(
+        getResults=lambda start, limit: ["a"],
+        getEstimatedMatches=lambda: 1,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: search_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("query", "test.zim", language="zh")
+    assert len(result["results"]) == 1
 
 
 def test_search_pagination_keeps_exact_title_first(
@@ -532,3 +750,130 @@ def test_extract_image_returns_native_mcp_content(
         ]
         is False
     )
+
+
+def test_links_recognize_extended_see_also_labels() -> None:
+    archive = SimpleNamespace(has_entry_by_path=lambda path: True)
+    soup = server.BeautifulSoup(
+        '<h2 id="延伸阅读">延伸阅读</h2>'
+        '<ul><li><a href="extra">Extra</a></li></ul>'
+        "<h2>References</h2>",
+        "html.parser",
+    )
+    see_also, links = server._find_links(archive, soup, "article", "zh_all.zim")
+    assert see_also == [
+        {
+            "article_path": "extra",
+            "title": "Extra",
+            "uri": "kiwix://zh_all.zim/extra",
+        }
+    ]
+    assert links == []
+
+
+def test_find_images_marks_main_figure_image() -> None:
+    soup = server.BeautifulSoup(
+        '<figure><img src="/lead.png" width="400">'
+        "<figcaption>Lead image</figcaption></figure>"
+        '<figure><img src="/second.png" width="300">'
+        "<figcaption>Second</figcaption></figure>",
+        "html.parser",
+    )
+    images = server._find_images(soup, "article")
+    assert images[0]["is_main"] is True
+    assert images[1]["is_main"] is False
+
+
+def test_find_images_skips_small_icon_as_main() -> None:
+    soup = server.BeautifulSoup(
+        '<img src="/icon.png" width="16">'
+        '<figure><img src="/lead.png" width="400">'
+        "<figcaption>Lead image</figcaption></figure>",
+        "html.parser",
+    )
+    images = server._find_images(soup, "article")
+    assert images[0]["is_main"] is False
+    assert images[1]["is_main"] is True
+
+
+def test_read_resource_truncates_long_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_text = "x" * (server.MAX_RESOURCE_CHARS + 100)
+    item = SimpleNamespace(
+        size=len(long_text),
+        mimetype="text/plain",
+        content=long_text.encode(),
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    result = asyncio.run(
+        server._read_resource_v2(
+            None,
+            SimpleNamespace(uri="kiwix://test.zim/article"),
+        )
+    )
+    assert result.meta["truncated"] is True
+    assert result.meta["total_chars"] == len(long_text)
+    assert result.meta["next_offset_hint"] == server.MAX_RESOURCE_CHARS
+    assert len(result.contents[0].text) == server.MAX_RESOURCE_CHARS
+    assert result.contents[0].meta["truncated"] is True
+
+
+def test_list_resources_skips_archive_with_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "_archive_paths",
+        lambda: {"bad.zim": Path("bad.zim"), "good.zim": Path("good.zim")},
+    )
+    good_archive = SimpleNamespace(
+        has_main_entry=True,
+        main_entry=SimpleNamespace(path="main", title="Main"),
+    )
+
+    def _archive(path: Path) -> object:
+        if path.name == "bad.zim":
+            raise OSError("cannot open")
+        return good_archive
+
+    monkeypatch.setattr(server, "_archive", _archive)
+    result = asyncio.run(server._list_resources_v2(None, None))
+    names = [r.name for r in result.resources]
+    assert "good.zim-main" in names
+    assert "bad.zim-main" not in names
+
+
+def test_list_resources_skips_when_main_entry_path_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "_archive_paths",
+        lambda: {"first.zim": Path("first.zim")},
+    )
+    monkeypatch.setattr(
+        server,
+        "_archive",
+        lambda path: SimpleNamespace(
+            has_main_entry=True,
+            main_entry=SimpleNamespace(
+                path="mainPage",
+                title="Main",
+                is_redirect=True,
+                get_redirect_entry=lambda: (_ for _ in ()).throw(
+                    RuntimeError("broken")
+                ),
+            ),
+        ),
+    )
+    result = asyncio.run(server._list_resources_v2(None, None))
+    assert result.resources == []

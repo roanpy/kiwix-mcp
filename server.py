@@ -168,8 +168,7 @@ def _parse_article_uri(uri: str) -> tuple[str, str]:
             raise ValueError(f"Invalid resource URI: {uri}")
     if not archive_id or not article_path:
         raise ValueError(f"Invalid resource URI: {uri}")
-    article_path = unquote(article_path)
-    return archive_id, article_path
+    return unquote(archive_id), unquote(article_path)
 
 
 def _main_entry_path(archive: Archive) -> str | None:
@@ -304,8 +303,14 @@ def search(
     limit: int = 5,
     offset: int = 0,
     mode: str = "auto",
+    language: str = "",
+    flavour: str = "",
 ) -> dict[str, Any]:
-    """Search one archive, or all archives with archive_id='*'."""
+    """Search one archive, or all archives with archive_id='*'.
+
+    language/flavour only filter archives in cross-archive mode ("*"); a
+    single explicitly selected archive is always searched as requested.
+    """
     query = query.strip()
     if not query:
         raise ValueError("query is required")
@@ -314,11 +319,40 @@ def search(
     mode = mode.strip().lower()
     if mode not in {"auto", "fulltext", "title"}:
         raise ValueError("mode must be one of: auto, fulltext, title")
+    language = language.strip().lower()
+    flavour = flavour.strip().lower()
+    cross_archive = archive_id.strip() == "*"
     limit = min(max(int(limit), 1), 20)
     offset = min(max(int(offset), 0), 1000)
-    selected = (
-        _select_paths("") if archive_id.strip() == "*" else _select_paths(archive_id)
-    )
+    selected = _select_paths("") if cross_archive else _select_paths(archive_id)
+
+    def _archive_matches(archive: Archive) -> bool:
+        """Cross-archive filter by language/flavour metadata; True when no filter."""
+        if not cross_archive:
+            return True
+        if language:
+            try:
+                value = bytes(archive.get_metadata("Language")).decode(
+                    "utf-8", errors="replace"
+                )
+            except (KeyError, RuntimeError, ValueError):
+                return False
+            value = value.lower().strip()
+            alias = _LANGUAGE_ALIASES.get(language, "")
+            if not any(
+                token in value.split(",") for token in (language, alias) if token
+            ):
+                return False
+        if flavour:
+            try:
+                value = bytes(archive.get_metadata("Flavour")).decode(
+                    "utf-8", errors="replace"
+                )
+            except (KeyError, RuntimeError, ValueError):
+                return False
+            if flavour != value.lower().strip():
+                return False
+        return True
 
     exact_matches: list[tuple[Archive, str, str, str]] = []
     other_matches: list[tuple[Archive, str, str, str]] = []
@@ -328,6 +362,8 @@ def search(
     for name, path in selected:
         try:
             archive = _archive(path)
+            if not _archive_matches(archive):
+                continue
             if mode == "fulltext":
                 if not archive.has_fulltext_index:
                     raise ValueError(
@@ -391,6 +427,7 @@ def search(
         "results": results,
         "errors": errors,
         "mode": mode,
+        "filters": {"language": language, "flavour": flavour},
     }
 
 
@@ -470,7 +507,43 @@ def read_article(
 
 MAX_SEE_ALSO_LINKS = 10
 MAX_BODY_LINKS = 15
-_SEE_ALSO_LABELS = {"see also", "参见", "參見"}
+# ZIM Language metadata uses ISO 639-2/T codes (e.g. "eng", "zho"); accept the
+# common two-letter ISO 639-1 alias when filtering cross-archive searches.
+_LANGUAGE_ALIASES = {
+    "en": "eng",
+    "zh": "zho",
+    "de": "deu",
+    "fr": "fra",
+    "es": "spa",
+    "it": "ita",
+    "pt": "por",
+    "ru": "rus",
+    "ja": "jpn",
+    "ko": "kor",
+    "ar": "ara",
+    "hi": "hin",
+    "nl": "nld",
+    "sv": "swe",
+    "pl": "pol",
+    "tr": "tur",
+}
+_SEE_ALSO_LABELS = {
+    "see also",
+    "参见",
+    "參見",
+    "参阅",
+    "參閱",
+    "另见",
+    "另見",
+    "延伸阅读",
+    "延伸閱讀",
+    "外部链接",
+    "外部連結",
+    "参考文献",
+    "參考文獻",
+    "参考",
+    "參考",
+}
 
 
 def _find_links(
@@ -543,6 +616,7 @@ def _find_images_in_article(
 
 def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
+    main_marked = False
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if not src:
@@ -554,6 +628,11 @@ def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]
         figure = img.find_parent("figure")
         caption = figure.find("figcaption") if figure else None
         width, height = img.get("width"), img.get("height")
+        width_value = int(width) if str(width).isdigit() else None
+        is_main = False
+        if not main_marked and figure and (width_value is None or width_value >= 200):
+            is_main = True
+            main_marked = True
         images.append(
             {
                 "index": len(images),
@@ -562,8 +641,9 @@ def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]
                 "filename": posixpath.basename(image_path),
                 "alt": str(img.get("alt", "")),
                 "caption": caption.get_text(" ", strip=True) if caption else "",
-                "width": int(width) if str(width).isdigit() else None,
+                "width": width_value,
                 "height": int(height) if str(height).isdigit() else None,
+                "is_main": is_main,
             }
         )
     return images
@@ -720,6 +800,14 @@ _TOOL_DEFINITIONS = [
                     "default": "auto",
                     "description": "auto picks fulltext when available, otherwise title-suggestion.",
                 },
+                "language": {
+                    "type": "string",
+                    "description": "Filter cross-archive search by language code (e.g. 'zh', 'en'); only effective with archive_id='*'.",
+                },
+                "flavour": {
+                    "type": "string",
+                    "description": "Filter cross-archive search by flavour (e.g. 'maxi', 'nopic'); only effective with archive_id='*'.",
+                },
             },
             "required": ["query", "archive_id"],
         },
@@ -732,6 +820,13 @@ _TOOL_DEFINITIONS = [
                 "next_offset": {"type": ["integer", "null"]},
                 "estimated_matches": {"type": ["integer", "null"]},
                 "mode": {"type": "string", "enum": ["auto", "fulltext", "title"]},
+                "filters": {
+                    "type": "object",
+                    "properties": {
+                        "language": {"type": "string"},
+                        "flavour": {"type": "string"},
+                    },
+                },
                 "results": {
                     "type": "array",
                     "items": {
