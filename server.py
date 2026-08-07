@@ -893,7 +893,7 @@ def _archive_resources() -> list[Resource]:
                     uri=_article_uri(archive_id, article_path),
                     description=f"Main entry for {archive_id}",
                     mimeType="text/plain",
-                    _meta={
+                    meta={
                         "archive_id": archive_id,
                         "article_path": article_path,
                         "resource_type": "main_entry",
@@ -944,13 +944,13 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
                 uri=uri,
                 mimeType="text/plain",
                 text=text,
-                _meta={
+                meta={
                     "truncated": truncated,
                     "next_offset_hint": meta.get("next_offset_hint"),
                 },
             )
         ],
-        _meta=meta,
+        meta=meta,
     )
 
 
