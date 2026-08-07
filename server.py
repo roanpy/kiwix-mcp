@@ -14,7 +14,7 @@ from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from bs4 import BeautifulSoup
 from libzim import Archive, Query, Searcher, SuggestionSearcher
@@ -24,9 +24,15 @@ from mcp.types import (
     CallToolResult,
     ImageContent,
     ListToolsResult,
+    ListResourceTemplatesResult,
+    ListResourcesResult,
+    ReadResourceResult,
     TextContent,
     Tool,
     ToolAnnotations,
+    Resource,
+    ResourceTemplate,
+    TextResourceContents,
 )
 
 DEFAULT_ARCHIVE_DIR = Path("/Users/user/.chroma_db/kiwix/archives")
@@ -35,6 +41,7 @@ MAX_ARTICLE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TEMP_IMAGES = 16
 MAX_IMAGE_REFERENCES = 30
+MAX_RESOURCE_CHARS = 50_000
 MAX_LOG_BYTES = 1 * 1024 * 1024
 LOG_BACKUP_COUNT = 2
 
@@ -139,6 +146,44 @@ def _entry(archive: Archive, article_path: str):
     return entry
 
 
+def _article_uri(archive_id: str, article_path: str) -> str:
+    return f"kiwix://{quote(str(archive_id), safe='')}/{quote(article_path, safe='/')}"
+
+
+def _parse_article_uri(uri: str) -> tuple[str, str]:
+    parsed = urlsplit(uri)
+    if parsed.scheme != "kiwix":
+        raise ValueError(f"Unsupported resource URI scheme: {parsed.scheme!r}")
+    if parsed.netloc:
+        archive_id = parsed.netloc
+        article_path = parsed.path.lstrip("/")
+        if not article_path:
+            raise ValueError(f"Invalid resource URI: {uri}")
+    else:
+        remainder = parsed.path.lstrip("/")
+        if "/" not in remainder:
+            raise ValueError(f"Invalid resource URI: {uri}")
+        archive_id, article_path = remainder.split("/", 1)
+        if not article_path:
+            raise ValueError(f"Invalid resource URI: {uri}")
+    if not archive_id or not article_path:
+        raise ValueError(f"Invalid resource URI: {uri}")
+    article_path = unquote(article_path)
+    return archive_id, article_path
+
+
+def _main_entry_path(archive: Archive) -> str | None:
+    if not getattr(archive, "has_main_entry", False):
+        return None
+    try:
+        main_entry = archive.main_entry
+        if getattr(main_entry, "is_redirect", False):
+            return str(main_entry.get_redirect_entry().path)
+        return str(main_entry.path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _plain_text(content: bytes, mimetype: str) -> str:
     text = content.decode("utf-8", errors="replace")
     if "html" not in mimetype.lower():
@@ -207,7 +252,7 @@ def _article_summary(
         "title": entry.title or item.title,
         "mimetype": item.mimetype,
         "snippet": summary,
-        "uri": f"kiwix://{archive_id}/{entry.path}",
+        "uri": _article_uri(archive_id, entry.path),
     }
 
 
@@ -225,6 +270,10 @@ def list_archives() -> dict[str, Any]:
             item["media_count"] = archive.media_count
             item["has_fulltext_index"] = archive.has_fulltext_index
             item["has_title_index"] = archive.has_title_index
+            item["has_main_entry"] = getattr(archive, "has_main_entry", False)
+            main_entry_path = _main_entry_path(archive)
+            if main_entry_path is not None:
+                item["main_entry_path"] = main_entry_path
             for key in (
                 "Title",
                 "Language",
@@ -250,7 +299,11 @@ def list_archives() -> dict[str, Any]:
 
 
 def search(
-    query: str, archive_id: str, limit: int = 5, offset: int = 0
+    query: str,
+    archive_id: str,
+    limit: int = 5,
+    offset: int = 0,
+    mode: str = "auto",
 ) -> dict[str, Any]:
     """Search one archive, or all archives with archive_id='*'."""
     query = query.strip()
@@ -258,6 +311,9 @@ def search(
         raise ValueError("query is required")
     if not archive_id.strip():
         raise ValueError("archive_id is required")
+    mode = mode.strip().lower()
+    if mode not in {"auto", "fulltext", "title"}:
+        raise ValueError("mode must be one of: auto, fulltext, title")
     limit = min(max(int(limit), 1), 20)
     offset = min(max(int(offset), 0), 1000)
     selected = (
@@ -272,12 +328,19 @@ def search(
     for name, path in selected:
         try:
             archive = _archive(path)
-            if archive.has_fulltext_index:
+            if mode == "fulltext":
+                if not archive.has_fulltext_index:
+                    raise ValueError(
+                        f"Archive does not support full-text search: {name}"
+                    )
                 search_result = Searcher(archive).search(Query().set_query(query))
-                mode = "fulltext"
-            else:
+                search_mode = "fulltext"
+            elif mode == "title" or not archive.has_fulltext_index:
                 search_result = SuggestionSearcher(archive).suggest(query)
-                mode = "title"
+                search_mode = "title"
+            else:
+                search_result = Searcher(archive).search(Query().set_query(query))
+                search_mode = "fulltext"
             exact_path = (
                 archive.get_entry_by_title(query).path
                 if archive.has_entry_by_title(query)
@@ -297,8 +360,10 @@ def search(
                 if article_path in seen:
                     continue
                 seen.add(article_path)
-                other_matches.append((archive, name, article_path, mode))
+                other_matches.append((archive, name, article_path, search_mode))
         except (OSError, RuntimeError, ValueError) as exc:
+            if mode == "fulltext":
+                raise
             errors.append({"archive_id": name, "error": str(exc)})
     matches = exact_matches + other_matches
     page_matches = matches[offset : offset + limit]
@@ -325,6 +390,7 @@ def search(
         "estimated_matches": estimated_matches if estimated_known else None,
         "results": results,
         "errors": errors,
+        "mode": mode,
     }
 
 
@@ -361,7 +427,7 @@ def read_article(
         if include_images:
             images = _find_images(soup, entry.path)
         if include_links:
-            see_also, links = _find_links(archive, soup, entry.path)
+            see_also, links = _find_links(archive, soup, entry.path, name)
         text = _soup_text(soup)
     else:
         text = _plain_text(content, item.mimetype)
@@ -377,7 +443,7 @@ def read_article(
         "next_offset": next_offset,
         "truncated": next_offset is not None,
         "total_chars": len(text),
-        "uri": f"kiwix://{name}/{entry.path}",
+        "uri": _article_uri(name, entry.path),
     }
     if include_images:
         images = images or []
@@ -408,7 +474,7 @@ _SEE_ALSO_LABELS = {"see also", "参见", "參見"}
 
 
 def _find_links(
-    archive: Archive, soup: BeautifulSoup, article_path: str
+    archive: Archive, soup: BeautifulSoup, article_path: str, archive_id: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Extract internal article links: curated See-also section first, then body links.
 
@@ -434,7 +500,13 @@ def _find_links(
         except RuntimeError:
             return
         seen.add(path)
-        target.append({"article_path": path, "title": anchor.get_text(" ", strip=True)})
+        target.append(
+            {
+                "article_path": path,
+                "uri": _article_uri(archive_id, path),
+                "title": anchor.get_text(" ", strip=True),
+            }
+        )
 
     for h2 in soup.find_all("h2"):
         label = (h2.get("id") or "").replace("_", " ").strip().lower()
@@ -621,6 +693,8 @@ _TOOL_DEFINITIONS = [
                         "properties": {
                             "archive_id": {"type": "string"},
                             "flavour": {"type": "string"},
+                            "has_main_entry": {"type": "boolean"},
+                            "main_entry_path": {"type": "string"},
                         },
                     },
                 },
@@ -640,6 +714,12 @@ _TOOL_DEFINITIONS = [
                 "archive_id": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "fulltext", "title"],
+                    "default": "auto",
+                    "description": "auto picks fulltext when available, otherwise title-suggestion.",
+                },
             },
             "required": ["query", "archive_id"],
         },
@@ -651,6 +731,7 @@ _TOOL_DEFINITIONS = [
                 "offset": {"type": "integer"},
                 "next_offset": {"type": ["integer", "null"]},
                 "estimated_matches": {"type": ["integer", "null"]},
+                "mode": {"type": "string", "enum": ["auto", "fulltext", "title"]},
                 "results": {
                     "type": "array",
                     "items": {
@@ -794,6 +875,109 @@ async def _list_tools_v2(_ctx: Any, _params: Any) -> ListToolsResult:
     return ListToolsResult(tools=_TOOL_DEFINITIONS)
 
 
+def _archive_resources() -> list[Resource]:
+    resources: list[Resource] = []
+    for archive_id, path in _archive_paths().items():
+        try:
+            archive = _archive(path)
+            if not archive.has_main_entry:
+                continue
+            article_path = _main_entry_path(archive)
+            if article_path is None:
+                continue
+            main_entry = archive.main_entry
+            resources.append(
+                Resource(
+                    name=f"{archive_id}-main",
+                    title=str(main_entry.title or archive_id),
+                    uri=_article_uri(archive_id, article_path),
+                    description=f"Main entry for {archive_id}",
+                    mimeType="text/plain",
+                    _meta={
+                        "archive_id": archive_id,
+                        "article_path": article_path,
+                        "resource_type": "main_entry",
+                    },
+                )
+            )
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return resources
+
+
+def _read_article_resource(uri: str) -> ReadResourceResult:
+    archive_id, article_path = _parse_article_uri(uri)
+    selected = _select_paths(archive_id)
+    if len(selected) != 1:
+        raise ValueError("archive_id is required")
+    _, path = selected[0]
+    archive = _archive(path)
+    try:
+        entry = _entry(archive, article_path)
+    except (OSError, RuntimeError, ValueError):
+        resolved_main_entry = _main_entry_path(archive)
+        if resolved_main_entry is None or article_path == resolved_main_entry:
+            raise
+        entry = _entry(archive, resolved_main_entry)
+    item = entry.get_item()
+    if item.size > MAX_ARTICLE_BYTES:
+        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+    if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
+        raise ValueError(f"Article is not text: {item.mimetype}")
+
+    full_text = _plain_text(bytes(item.content), item.mimetype)
+    truncated = len(full_text) > MAX_RESOURCE_CHARS
+    text = full_text if not truncated else full_text[:MAX_RESOURCE_CHARS].rstrip()
+    meta = {
+        "archive_id": archive_id,
+        "article_path": entry.path,
+        "mimetype": item.mimetype,
+        "status": "ok",
+        "total_chars": len(full_text),
+        "truncated": truncated,
+    }
+    if truncated:
+        meta["next_offset_hint"] = MAX_RESOURCE_CHARS
+    return ReadResourceResult(
+        contents=[
+            TextResourceContents(
+                uri=uri,
+                mimeType="text/plain",
+                text=text,
+                _meta={
+                    "truncated": truncated,
+                    "next_offset_hint": meta.get("next_offset_hint"),
+                },
+            )
+        ],
+        _meta=meta,
+    )
+
+
+async def _list_resources_v2(_ctx: Any, _params: Any) -> ListResourcesResult:
+    return ListResourcesResult(resources=_archive_resources())
+
+
+async def _list_resource_templates_v2(
+    _ctx: Any, _params: Any
+) -> ListResourceTemplatesResult:
+    return ListResourceTemplatesResult(
+        resourceTemplates=[
+            ResourceTemplate(
+                name="kiwix-article",
+                title="Kiwix article",
+                uriTemplate="kiwix://{archive_id}/{+article_path}",
+                description="Read article content from a ZIM archive.",
+                mimeType="text/plain",
+            )
+        ]
+    )
+
+
+async def _read_resource_v2(_ctx: Any, params: Any) -> ReadResourceResult:
+    return _read_article_resource(params.uri)
+
+
 async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
     try:
         return _mcp_result(_dispatch_tool(params.name, params.arguments or {}))
@@ -811,6 +995,9 @@ if "on_list_tools" in inspect.signature(Server).parameters:
         instructions=MCP_INSTRUCTIONS,
         on_list_tools=_list_tools_v2,
         on_call_tool=_call_tool_v2,
+        on_list_resources=_list_resources_v2,
+        on_list_resource_templates=_list_resource_templates_v2,
+        on_read_resource=_read_resource_v2,
     )
 else:
     mcp = Server("kiwix", instructions=MCP_INSTRUCTIONS)

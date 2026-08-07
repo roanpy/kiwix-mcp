@@ -24,7 +24,9 @@ Tools:
   `flavour` (for example `maxi` or `nopic`) for archive selection.
 - `search`: search one selected archive with exact-title priority, pagination,
   an estimated match count, and per-result `match_type`; use `archive_id="*"`
-  for a small cross-archive comparison.
+  for a small cross-archive comparison. Added `mode` parameter:
+  `auto` (default), `fulltext`, or `title`. `fulltext` is strict and fails on
+  archives without full-text index; `title` forces title-only suggestion lookup.
 - `read_article`: bounded text with `next_offset` continuation, capped image
   metadata, image metadata pagination via `image_offset`, and concise related links.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
@@ -32,9 +34,18 @@ Tools:
   index 0 is not the desired image. Temporary images are deduplicated and capped
   at the 16 most recently used files.
 
+MCP resources (2.x):
+
+- Resource template:
+  `kiwix://{archive_id}/{+article_path}`
+- `list_resources`: returns each archive's main entry as a `text/plain` resource.
+- `read_resource`: return plain article text from a stable URI with truncation metadata
+  (for long articles, use `read_article` with `next_offset`).
+- Resource clients can still load article text through `read_resource` when images are
+  unavailable.
+
 Set `KIWIX_ARCHIVE_DIR` to use another archive directory. Single-file `.zim`
-and split `.zimaa` archives are detected. The calling agent is instructed to
-translate answers into the user's language while preserving source URIs.
+and split `.zimaa` archives are detected.
 
 When `read_article` returns `next_offset`, call it again with the same
 `archive_id` and `article_path` plus that `offset` to continue a long article.
