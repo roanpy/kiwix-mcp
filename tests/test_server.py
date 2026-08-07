@@ -122,9 +122,137 @@ def test_mcp_tool_registry_is_stable() -> None:
         "match_type"
         in result.tools[1].output_schema["properties"]["results"]["items"]["properties"]
     )
+    assert "mode" in result.tools[1].input_schema["properties"]
     assert "offset" in result.tools[2].input_schema["properties"]
     assert "image_offset" in result.tools[2].input_schema["properties"]
     assert "image_path" in result.tools[3].input_schema["properties"]
+
+
+def test_mcp_resource_template_is_available() -> None:
+    result = asyncio.run(server._list_resource_templates_v2(None, None))
+    assert [item.uri_template for item in result.resource_templates] == [
+        "kiwix://{archive_id}/{+article_path}"
+    ]
+
+
+def test_mcp_resource_list_uses_main_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archives = {"first.zim": Path("first.zim"), "second.zim": Path("second.zim")}
+    monkeypatch.setattr(
+        server,
+        "_archive_paths",
+        lambda: archives,
+    )
+    monkeypatch.setattr(
+        server,
+        "_archive",
+        lambda path: SimpleNamespace(
+            has_main_entry=path.name == "first.zim",
+            main_entry=SimpleNamespace(path="main", title="Main"),
+        ),
+    )
+    result = asyncio.run(server._list_resources_v2(None, None))
+    resources = {r.name: r for r in result.resources}
+    assert "first.zim-main" in resources
+    assert resources["first.zim-main"].uri == "kiwix://first.zim/main"
+    assert "second.zim-main" not in resources
+
+
+def test_mcp_resource_list_resolves_redirect_main_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archives = {"first.zim": Path("first.zim")}
+    monkeypatch.setattr(
+        server,
+        "_archive_paths",
+        lambda: archives,
+    )
+    monkeypatch.setattr(
+        server,
+        "_archive",
+        lambda path: SimpleNamespace(
+            has_main_entry=True,
+            main_entry=SimpleNamespace(
+                path="mainPage",
+                title="Main",
+                is_redirect=True,
+                get_redirect_entry=lambda: SimpleNamespace(path="questions"),
+            ),
+        ),
+    )
+
+    result = asyncio.run(server._list_resources_v2(None, None))
+    resources = {r.name: r for r in result.resources}
+    assert resources["first.zim-main"].uri == "kiwix://first.zim/questions"
+    assert resources["first.zim-main"].meta["article_path"] == "questions"
+
+
+def test_resource_read_returns_clean_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = SimpleNamespace(
+        size=20,
+        mimetype="text/html",
+        content=b"<html><p>Hello <b>World</b></p></html>",
+    )
+    archive = SimpleNamespace(main_entry=SimpleNamespace(path="main"))
+    entry = SimpleNamespace(
+        path="topic/Article.html", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(server, "_entry", lambda archive, path: entry)
+
+    result = asyncio.run(
+        server._read_resource_v2(
+            None,
+            SimpleNamespace(uri="kiwix://test.zim/topic/Article.html"),
+        )
+    )
+    assert result.contents[0].text == "Hello World"
+
+
+def test_read_resource_follows_main_entry_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = SimpleNamespace(
+        size=40,
+        mimetype="text/html",
+        content=b"<html><p>Hello from resolved main entry</p></html>",
+    )
+
+    def _entry(_archive: object, article_path: str):
+        if article_path == "questions":
+            return SimpleNamespace(path="questions", get_item=lambda: item)
+        raise ValueError(f"Cannot find entry: {article_path}")
+
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("first.zim", Path("first.zim"))]
+    )
+    monkeypatch.setattr(
+        server,
+        "_archive",
+        lambda path: SimpleNamespace(
+            has_main_entry=True,
+            main_entry=SimpleNamespace(
+                path="mainPage",
+                is_redirect=True,
+                get_redirect_entry=lambda: SimpleNamespace(path="questions"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(server, "_entry", _entry)
+
+    result = asyncio.run(
+        server._read_resource_v2(
+            None,
+            SimpleNamespace(uri="kiwix://first.zim/mainPage"),
+        )
+    )
+    assert result.contents[0].text == "Hello from resolved main entry"
 
 
 def test_zim_image_url_resolution() -> None:
@@ -163,17 +291,49 @@ def test_links_prefer_see_also_and_fallback_to_body() -> None:
         '<ul><li><a href="related">Related</a></li></ul><h2>References</h2>',
         "html.parser",
     )
-    see_also, links = server._find_links(archive, soup, "article")
-    assert see_also == [{"article_path": "related", "title": "Related"}]
+    see_also, links = server._find_links(archive, soup, "article", "en_all.zim")
+    assert see_also == [
+        {
+            "article_path": "related",
+            "title": "Related",
+            "uri": "kiwix://en_all.zim/related",
+        }
+    ]
     assert links == []
 
     see_also, links = server._find_links(
         archive,
         server.BeautifulSoup('<a href="body">Body</a>', "html.parser"),
         "article",
+        "en_all.zim",
     )
     assert see_also == []
-    assert links == [{"article_path": "body", "title": "Body"}]
+    assert links == [
+        {"article_path": "body", "title": "Body", "uri": "kiwix://en_all.zim/body"}
+    ]
+
+
+def test_search_mode_can_forbid_fulltext_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=False, has_entry_by_title=lambda query: False
+    )
+    monkeypatch.setattr(
+        server,
+        "_select_paths",
+        lambda archive_id: [("test.zim", Path("test.zim"))],
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    with pytest.raises(ValueError, match="does not support full-text search"):
+        server.search("query", "test.zim", mode="fulltext")
+
+
+def test_article_uri_round_trip() -> None:
+    uri = server._article_uri("zh_all.zim", "Science/Topic A")
+    archive_id, article_path = server._parse_article_uri(uri)
+    assert archive_id == "zh_all.zim"
+    assert article_path == "Science/Topic A"
 
 
 def test_search_pagination_keeps_exact_title_first(
@@ -206,6 +366,7 @@ def test_search_pagination_keeps_exact_title_first(
 
     first = server.search("Exact", "test.zim", limit=2)
     second = server.search("Exact", "test.zim", limit=2, offset=2)
+    assert first["mode"] == "auto"
     assert [item["article_path"] for item in first["results"]] == ["exact", "other-1"]
     assert [item["match_type"] for item in first["results"]] == [
         "exact_title",
@@ -275,6 +436,7 @@ def test_search_can_aggregate_all_archives(
 
     result = server.search("query", "*", limit=3)
 
+    assert result["mode"] == "auto"
     assert [item["article_path"] for item in result["results"]] == ["a", "b", "c"]
     assert [item["archive_id"] for item in result["results"]] == [
         "first.zim",
