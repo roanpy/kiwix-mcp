@@ -125,6 +125,11 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert "mode" in result.tools[1].input_schema["properties"]
     assert "offset" in result.tools[2].input_schema["properties"]
     assert "image_offset" in result.tools[2].input_schema["properties"]
+    article_output = result.tools[2].output_schema["properties"]
+    assert "images" in article_output
+    assert "is_main" not in article_output["images"]["items"]["properties"]
+    assert "see_also" in article_output
+    assert "links" in article_output
     assert "image_path" in result.tools[3].input_schema["properties"]
 
 
@@ -217,44 +222,28 @@ def test_resource_read_returns_clean_text(
     assert result.contents[0].meta["truncated"] is False
 
 
-def test_read_resource_follows_main_entry_redirect(
+def test_read_resource_does_not_substitute_missing_article_with_main_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    item = SimpleNamespace(
-        size=40,
-        mimetype="text/html",
-        content=b"<html><p>Hello from resolved main entry</p></html>",
-    )
-
-    def _entry(_archive: object, article_path: str):
-        if article_path == "questions":
-            return SimpleNamespace(path="questions", get_item=lambda: item)
-        raise ValueError(f"Cannot find entry: {article_path}")
-
     monkeypatch.setattr(
         server, "_select_paths", lambda archive_id: [("first.zim", Path("first.zim"))]
     )
+    monkeypatch.setattr(server, "_archive", lambda path: SimpleNamespace())
     monkeypatch.setattr(
         server,
-        "_archive",
-        lambda path: SimpleNamespace(
-            has_main_entry=True,
-            main_entry=SimpleNamespace(
-                path="mainPage",
-                is_redirect=True,
-                get_redirect_entry=lambda: SimpleNamespace(path="questions"),
-            ),
+        "_entry",
+        lambda archive, article_path: (_ for _ in ()).throw(
+            ValueError(f"Cannot find entry: {article_path}")
         ),
     )
-    monkeypatch.setattr(server, "_entry", _entry)
 
-    result = asyncio.run(
-        server._read_resource_v2(
-            None,
-            SimpleNamespace(uri="kiwix://first.zim/mainPage"),
+    with pytest.raises(ValueError, match="mainPage"):
+        asyncio.run(
+            server._read_resource_v2(
+                None,
+                SimpleNamespace(uri="kiwix://first.zim/mainPage"),
+            )
         )
-    )
-    assert result.contents[0].text == "Hello from resolved main entry"
 
 
 def test_zim_image_url_resolution() -> None:
@@ -283,7 +272,6 @@ def test_image_metadata_uses_caption_and_dimensions() -> None:
         "caption": "Useful caption",
         "width": 250,
         "height": 166,
-        "is_main": True,
     }
 
 
@@ -523,6 +511,37 @@ def test_search_cross_archive_filters_by_language(
     # unknown language matches nothing
     result = server.search("query", "*", language="xx")
     assert result["results"] == []
+
+
+def test_search_language_filter_strips_metadata_whitespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        get_metadata=lambda key: b"eng, zho" if key == "Language" else b"",
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: ["article"],
+                getEstimatedMatches=lambda: 1,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    assert server.search("query", "*", language="zh")["results"]
 
 
 def test_search_single_archive_ignores_language_filter(
@@ -771,29 +790,17 @@ def test_links_recognize_extended_see_also_labels() -> None:
     assert links == []
 
 
-def test_find_images_marks_main_figure_image() -> None:
+def test_links_do_not_treat_references_as_see_also() -> None:
+    archive = SimpleNamespace(has_entry_by_path=lambda path: True)
     soup = server.BeautifulSoup(
-        '<figure><img src="/lead.png" width="400">'
-        "<figcaption>Lead image</figcaption></figure>"
-        '<figure><img src="/second.png" width="300">'
-        "<figcaption>Second</figcaption></figure>",
+        '<h2 id="参考文献">参考文献</h2><a href="source">Source</a>',
         "html.parser",
     )
-    images = server._find_images(soup, "article")
-    assert images[0]["is_main"] is True
-    assert images[1]["is_main"] is False
 
+    see_also, links = server._find_links(archive, soup, "article", "zh_all.zim")
 
-def test_find_images_skips_small_icon_as_main() -> None:
-    soup = server.BeautifulSoup(
-        '<img src="/icon.png" width="16">'
-        '<figure><img src="/lead.png" width="400">'
-        "<figcaption>Lead image</figcaption></figure>",
-        "html.parser",
-    )
-    images = server._find_images(soup, "article")
-    assert images[0]["is_main"] is False
-    assert images[1]["is_main"] is True
+    assert see_also == []
+    assert links[0]["article_path"] == "source"
 
 
 def test_read_resource_truncates_long_text(

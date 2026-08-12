@@ -2,16 +2,17 @@
 
 Local MCP server for searching and reading ZIM archives.
 
-Place archives in:
+Install the locked environment and place archives in:
 
-```text
-/Users/peter/.chroma_db/kiwix/archives
+```bash
+uv sync --frozen
+mkdir -p ~/.chroma_db/kiwix/archives
 ```
 
 Run over stdio:
 
 ```bash
-/Users/peter/Developer/kiwix-mcp/.venv/bin/python /Users/peter/Developer/kiwix-mcp/server.py
+uv run --frozen python server.py
 ```
 
 The server uses the MCP 2.x low-level `Server` API and keeps the legacy
@@ -30,12 +31,11 @@ Tools:
   archives without full-text index; `title` forces title-only suggestion lookup.
   Optional `language` and `flavour` filter archives in cross-archive mode only.
 - `read_article`: bounded text with `next_offset` continuation, capped image
-  metadata (each image entry includes `is_main` for the heuristic lead image),
-  image metadata pagination via `image_offset`, and concise related links
+  metadata, image metadata pagination via `image_offset`, and concise related links
   (each link/see-also entry carries a `uri` field).
 - `extract_image`: return native MCP image content plus a temporary `file_path`
   fallback for clients such as pi. Pass `image_path` from `read_article` when
-  index 0 is not the desired image; prefer entries with `is_main=True`.
+  index 0 is not the desired image.
   Temporary images are deduplicated and capped at the 16 most recently used files.
 
 MCP resources (2.x):
@@ -51,7 +51,8 @@ MCP resources (2.x):
   unavailable.
 
 Set `KIWIX_ARCHIVE_DIR` to use another archive directory. Single-file `.zim`
-and split `.zimaa` archives are detected.
+and split `.zimaa` archives are detected. Existing local installations that
+store archives elsewhere should keep setting this variable explicitly.
 
 When `read_article` returns `next_offset`, call it again with the same
 `archive_id` and `article_path` plus that `offset` to continue a long article.
@@ -61,3 +62,7 @@ that `image_offset` to continue a long image list.
 Diagnostics are off by default. Set `KIWIX_MCP_LOG_LEVEL=INFO` for stderr logs,
 or set `KIWIX_MCP_LOG_FILE=/path/to/kiwix.log` for a small rotating log (up to
 three 1 MiB files).
+
+This repository currently has no project license and is not an open-source
+release. Before redistribution, choose a project license and review the
+GPL-3.0 license shipped with the `libzim` dependency.

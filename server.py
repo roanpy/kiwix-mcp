@@ -35,7 +35,7 @@ from mcp.types import (
     TextResourceContents,
 )
 
-DEFAULT_ARCHIVE_DIR = Path("/Users/peter/.chroma_db/kiwix/archives")
+DEFAULT_ARCHIVE_DIR = Path.home() / ".chroma_db" / "kiwix" / "archives"
 IMAGE_TEMP_DIR = Path(tempfile.gettempdir()) / "kiwix-mcp"
 MAX_ARTICLE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -337,11 +337,9 @@ def search(
                 )
             except (KeyError, RuntimeError, ValueError):
                 return False
-            value = value.lower().strip()
+            languages = {token.strip() for token in value.lower().split(",")}
             alias = _LANGUAGE_ALIASES.get(language, "")
-            if not any(
-                token in value.split(",") for token in (language, alias) if token
-            ):
+            if not any(token in languages for token in (language, alias) if token):
                 return False
         if flavour:
             try:
@@ -537,12 +535,6 @@ _SEE_ALSO_LABELS = {
     "另見",
     "延伸阅读",
     "延伸閱讀",
-    "外部链接",
-    "外部連結",
-    "参考文献",
-    "參考文獻",
-    "参考",
-    "參考",
 }
 
 
@@ -616,7 +608,6 @@ def _find_images_in_article(
 
 def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
-    main_marked = False
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if not src:
@@ -629,10 +620,6 @@ def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]
         caption = figure.find("figcaption") if figure else None
         width, height = img.get("width"), img.get("height")
         width_value = int(width) if str(width).isdigit() else None
-        is_main = False
-        if not main_marked and figure and (width_value is None or width_value >= 200):
-            is_main = True
-            main_marked = True
         images.append(
             {
                 "index": len(images),
@@ -643,7 +630,6 @@ def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]
                 "caption": caption.get_text(" ", strip=True) if caption else "",
                 "width": width_value,
                 "height": int(height) if str(height).isdigit() else None,
-                "is_main": is_main,
             }
         )
     return images
@@ -897,6 +883,46 @@ _TOOL_DEFINITIONS = [
                 "total_images": {"type": "integer"},
                 "image_offset": {"type": "integer"},
                 "next_image_offset": {"type": ["integer", "null"]},
+                "images_truncated": {"type": "boolean"},
+                "images": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "src": {"type": "string"},
+                            "image_path": {"type": "string"},
+                            "filename": {"type": "string"},
+                            "alt": {"type": "string"},
+                            "caption": {"type": "string"},
+                            "width": {"type": ["integer", "null"]},
+                            "height": {"type": ["integer", "null"]},
+                        },
+                    },
+                },
+                "see_also": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "article_path": {"type": "string"},
+                            "uri": {"type": "string"},
+                            "title": {"type": "string"},
+                        },
+                    },
+                },
+                "links": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "article_path": {"type": "string"},
+                            "uri": {"type": "string"},
+                            "title": {"type": "string"},
+                        },
+                    },
+                },
+                "total_links": {"type": "integer"},
             },
             "required": [
                 "status",
@@ -1007,13 +1033,7 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
         raise ValueError("archive_id is required")
     _, path = selected[0]
     archive = _archive(path)
-    try:
-        entry = _entry(archive, article_path)
-    except (OSError, RuntimeError, ValueError):
-        resolved_main_entry = _main_entry_path(archive)
-        if resolved_main_entry is None or article_path == resolved_main_entry:
-            raise
-        entry = _entry(archive, resolved_main_entry)
+    entry = _entry(archive, article_path)
     item = entry.get_item()
     if item.size > MAX_ARTICLE_BYTES:
         raise ValueError(f"Article is too large to read safely: {item.size} bytes")
