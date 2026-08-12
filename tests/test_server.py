@@ -118,6 +118,10 @@ def test_mcp_tool_registry_is_stable() -> None:
             "properties"
         ]
     )
+    archive_output = result.tools[0].output_schema["properties"]["archives"]["items"][
+        "properties"
+    ]
+    assert {"size_bytes", "article_count", "language", "error"} <= archive_output.keys()
     assert (
         "match_type"
         in result.tools[1].output_schema["properties"]["results"]["items"]["properties"]
@@ -126,6 +130,7 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert "offset" in result.tools[2].input_schema["properties"]
     assert "image_offset" in result.tools[2].input_schema["properties"]
     article_output = result.tools[2].output_schema["properties"]
+    assert "mimetype" in article_output
     assert "images" in article_output
     assert "is_main" not in article_output["images"]["items"]["properties"]
     assert "see_also" in article_output
