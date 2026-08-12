@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import inspect
 import json
@@ -650,19 +651,27 @@ def _resolve_image_path(article_path: str, src: str) -> str:
 
 def _cache_image(raw: bytes, mimetype: str) -> Path:
     IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = mimetypes.guess_extension(mimetype) or ".img"
-    file_path = IMAGE_TEMP_DIR / f"{hashlib.sha256(raw).hexdigest()[:16]}{suffix}"
-    if file_path.exists():
-        file_path.touch()
-    else:
-        file_path.write_bytes(raw)
-    files = sorted(
-        (path for path in IMAGE_TEMP_DIR.iterdir() if path.is_file()),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
-    )
-    for stale in files[MAX_TEMP_IMAGES:]:
-        stale.unlink(missing_ok=True)
+    lock_path = IMAGE_TEMP_DIR / ".lock"
+    with lock_path.open("a+b") as lock_file:
+        # Every stdio client has its own process, but all clients share this cache.
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        suffix = mimetypes.guess_extension(mimetype) or ".img"
+        file_path = IMAGE_TEMP_DIR / f"{hashlib.sha256(raw).hexdigest()[:16]}{suffix}"
+        if file_path.exists():
+            file_path.touch()
+        else:
+            file_path.write_bytes(raw)
+        files = sorted(
+            (
+                path
+                for path in IMAGE_TEMP_DIR.iterdir()
+                if path.is_file() and path != lock_path
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in files[MAX_TEMP_IMAGES:]:
+            stale.unlink(missing_ok=True)
     return file_path
 
 
