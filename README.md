@@ -15,6 +15,11 @@ Run over stdio:
 uv run --frozen python server.py
 ```
 
+For Hermes, set `lazy: true` and `idle_timeout_seconds: 900` on this server.
+Keep `supports_parallel_tool_calls` unset: separate clients already use separate
+stdio processes, while one Agent session stays serialized for predictable libzim
+access.
+
 The server uses the MCP 2.x low-level `Server` API and keeps the legacy
 initialize/session path available for older MCP clients. The tool names and
 stdio command remain unchanged.
