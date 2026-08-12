@@ -1,6 +1,10 @@
 import asyncio
+import json
 import os
 from pathlib import Path
+import select
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -766,7 +770,10 @@ def test_extract_image_returns_native_mcp_content(
     assert isinstance(result.content[0], TextContent)
     assert isinstance(result.content[1], ImageContent)
     assert result.content[1].model_dump(by_alias=True)["mimeType"] == "image/webp"
-    assert next(tmp_path.iterdir()).read_bytes() == b"img"
+    assert (
+        next(path for path in tmp_path.iterdir() if path.name != ".lock").read_bytes()
+        == b"img"
+    )
     assert not old.exists()
     assert (
         server._TOOL_DEFINITIONS[-1].annotations.model_dump(by_alias=True)[
@@ -889,3 +896,97 @@ def test_list_resources_skips_when_main_entry_path_none(
     )
     result = asyncio.run(server._list_resources_v2(None, None))
     assert result.resources == []
+
+
+def test_stdio_protocol_round_trip(tmp_path: Path) -> None:
+    messages = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "list_archives", "arguments": {}},
+        },
+    ]
+    env = {**os.environ, "KIWIX_ARCHIVE_DIR": str(tmp_path)}
+    process = subprocess.Popen(
+        [sys.executable, str(Path(server.__file__))],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        bufsize=1,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    responses = {}
+    for message in messages:
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+        if "id" in message:
+            assert select.select([process.stdout], [], [], 15)[0]
+            response = json.loads(process.stdout.readline())
+            responses[response["id"]] = response
+    process.stdin.close()
+    try:
+        returncode = process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    assert process.stdout.read() == ""
+    assert returncode == 0, stderr
+
+    assert responses[1]["result"]["protocolVersion"] == "2025-11-25"
+    assert [tool["name"] for tool in responses[2]["result"]["tools"]] == [
+        "list_archives",
+        "search",
+        "read_article",
+        "extract_image",
+    ]
+    assert responses[3]["result"]["resources"] == []
+    assert responses[4]["result"]["isError"] is False
+
+
+def test_image_cache_is_safe_across_processes(tmp_path: Path) -> None:
+    code = """
+import sys
+from pathlib import Path
+import server
+server.IMAGE_TEMP_DIR = Path(sys.argv[1])
+for index in range(20):
+    server._cache_image(f"{sys.argv[2]}-{index}".encode(), "image/png")
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, str(tmp_path), str(index)],
+            cwd=Path(server.__file__).parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for index in range(12)
+    ]
+    results = [process.communicate(timeout=30) for process in processes]
+
+    assert all(process.returncode == 0 for process in processes), "\n".join(
+        stderr for _, stderr in results if stderr
+    )
+    assert (
+        len([path for path in tmp_path.iterdir() if path.name != ".lock"])
+        <= server.MAX_TEMP_IMAGES
+    )
