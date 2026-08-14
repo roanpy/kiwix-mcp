@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import base64
+from copy import copy
 import fcntl
 import hashlib
-import inspect
 import json
 import logging
 import mimetypes
@@ -43,6 +43,11 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TEMP_IMAGES = 16
 MAX_IMAGE_REFERENCES = 30
 MAX_RESOURCE_CHARS = 50_000
+MAX_LEAD_CHARS = 2_000
+MAX_OUTLINE_ITEMS = 200
+MAX_INFOBOX_FACTS = 40
+MAX_REFERENCE_TEXT_CHARS = 2_000
+MAX_REFERENCE_LINKS = 5
 MAX_LOG_BYTES = 1 * 1024 * 1024
 LOG_BACKUP_COUNT = 2
 
@@ -52,11 +57,14 @@ MCP_INSTRUCTIONS = (
     "Search and read local ZIM archives. Use list_archives and choose archive_id "
     "by language and collection: prefer full archives for coverage and maxi archives "
     "when images matter; use title, date, and description to break ties. "
+    "For long Wikipedia articles, call inspect_article first, then read_article with "
+    "a returned section anchor. Use list_references when a claim needs provenance. "
     "For images, inspect read_article metadata and prefer image_path over index 0. "
     "For cross-archive comparison, call search with archive_id='*'. "
     "Ask only when the user's goal leaves the choice ambiguous. "
-    "Answer in the user's language; "
-    "translate source text when needed, preserve proper nouns, and keep source URIs."
+    "For bilingual Wikipedia research, translate the search query into each archive's "
+    "language and search the archives separately; do not assume article paths match. "
+    "Answer in the user's language, preserve proper nouns, archive dates, and source URIs."
 )
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -151,6 +159,10 @@ def _article_uri(archive_id: str, article_path: str) -> str:
     return f"kiwix://{quote(str(archive_id), safe='')}/{quote(article_path, safe='/')}"
 
 
+def _section_uri(archive_id: str, article_path: str, section: str) -> str:
+    return f"{_article_uri(archive_id, article_path)}#{quote(section, safe='')}"
+
+
 def _parse_article_uri(uri: str) -> tuple[str, str]:
     parsed = urlsplit(uri)
     if parsed.scheme != "kiwix":
@@ -172,6 +184,10 @@ def _parse_article_uri(uri: str) -> tuple[str, str]:
     return unquote(archive_id), unquote(article_path)
 
 
+def _parse_article_section(uri: str) -> str:
+    return unquote(urlsplit(uri).fragment)
+
+
 def _main_entry_path(archive: Archive) -> str | None:
     if not getattr(archive, "has_main_entry", False):
         return None
@@ -184,6 +200,13 @@ def _main_entry_path(archive: Archive) -> str | None:
         return None
 
 
+def _archive_metadata(archive: Archive, key: str) -> str | None:
+    try:
+        return bytes(archive.get_metadata(key)).decode("utf-8", errors="replace")
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _plain_text(content: bytes, mimetype: str) -> str:
     text = content.decode("utf-8", errors="replace")
     if "html" not in mimetype.lower():
@@ -191,22 +214,313 @@ def _plain_text(content: bytes, mimetype: str) -> str:
     return _soup_text(BeautifulSoup(text, "html.parser"))
 
 
-def _soup_text(soup: BeautifulSoup) -> str:
-    for node in soup(["script", "style", "noscript", "svg"]):
-        node.decompose()
-    for node in soup.find_all("br"):
+_HEADING_TAGS = ("h2", "h3", "h4", "h5", "h6")
+_MEDIAWIKI_NOISE = (
+    ".navbox",
+    ".sidebar",
+    ".vertical-navbox",
+    ".infobox",
+    ".mw-references-wrap",
+    ".reflist",
+    "ol.references",
+    ".mw-editsection",
+    "#toc",
+    ".toc",
+    "#catlinks",
+    ".catlinks",
+    ".printfooter",
+    ".noprint",
+)
+_STACKEXCHANGE_NOISE = (
+    ".votecell",
+    ".post-signature",
+    ".post-taglist",
+    ".comments",
+    ".js-post-menu",
+    ".question-status",
+    ".bottom-notice",
+)
+
+
+def _content_root(soup: BeautifulSoup) -> tuple[Any, bool]:
+    mediawiki = soup.select_one(".mw-parser-output")
+    if mediawiki is not None:
+        return mediawiki, True
+    return (
+        soup.select_one("#mainbar")
+        or soup.select_one("main")
+        or soup.select_one("article")
+        or soup.select_one("#content")
+        or soup.body
+        or soup,
+        False,
+    )
+
+
+def _render_text(root: Any, mediawiki: bool) -> str:
+    for node in list(root.select("script, style, noscript, svg, nav, header, footer")):
+        if node.parent is not None:
+            node.decompose()
+    _drop_hidden(root)
+    if mediawiki:
+        for node in list(root.select(", ".join(_MEDIAWIKI_NOISE))):
+            if node.parent is not None:
+                node.decompose()
+    elif root.get("id") == "mainbar":
+        for node in list(root.select(", ".join(_STACKEXCHANGE_NOISE))):
+            if node.parent is not None:
+                node.decompose()
+    for node in root.find_all("br"):
         node.replace_with("\n")
-    for node in soup.find_all(["th", "td"]):
+    for node in root.find_all(["th", "td"]):
         node.insert_after("\t")
-    for node in soup.find_all(
+    for node in root.find_all(
         ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "figcaption"]
     ):
         node.insert_after("\n")
     return "\n".join(
         line
-        for line in (" ".join(part.split()) for part in soup.get_text().splitlines())
+        for line in (" ".join(part.split()) for part in root.get_text().splitlines())
         if line
     )
+
+
+def _drop_hidden(root: Any) -> None:
+    for node in list(root.find_all(True)):
+        if node.parent is None:
+            continue
+        style = str(node.get("style") or "").replace(" ", "").casefold()
+        if node.has_attr("hidden") or "display:none" in style:
+            node.decompose()
+
+
+def _soup_text(soup: BeautifulSoup) -> str:
+    root, mediawiki = _content_root(soup)
+    return _render_text(root, mediawiki)
+
+
+def _compact_text(node: Any, max_chars: int | None = None) -> str:
+    text = " ".join(node.get_text(" ", strip=True).split())
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars].rstrip()
+    return text
+
+
+def _is_mediawiki_noise(node: Any) -> bool:
+    for parent in (node, *node.parents):
+        classes = set(parent.get("class") or []) if hasattr(parent, "get") else set()
+        if classes.intersection(
+            {
+                "navbox",
+                "sidebar",
+                "vertical-navbox",
+                "infobox",
+                "mw-references-wrap",
+                "reflist",
+            }
+        ):
+            return True
+        if getattr(parent, "name", None) == "ol" and "references" in classes:
+            return True
+    return False
+
+
+def _section_key(value: str) -> str:
+    return " ".join(unquote(value).replace("_", " ").split()).casefold()
+
+
+def _heading_anchor(heading: Any) -> str:
+    return str(heading.get("id") or _compact_text(heading)).strip()
+
+
+def _article_outline(
+    soup: BeautifulSoup, archive_id: str, article_path: str
+) -> tuple[list[dict[str, Any]], int]:
+    root, mediawiki = _content_root(soup)
+    headings = [
+        heading
+        for heading in root.find_all(_HEADING_TAGS)
+        if _compact_text(heading)
+        and (not mediawiki or not _is_mediawiki_noise(heading))
+    ]
+    outline = []
+    for heading in headings[:MAX_OUTLINE_ITEMS]:
+        anchor = _heading_anchor(heading)
+        outline.append(
+            {
+                "level": int(heading.name[1]),
+                "title": _compact_text(heading),
+                "anchor": anchor,
+                "uri": _section_uri(archive_id, article_path, anchor),
+            }
+        )
+    return outline, len(headings)
+
+
+def _find_section(root: Any, section: str) -> Any:
+    requested = _section_key(section)
+    headings = [
+        heading for heading in root.find_all(_HEADING_TAGS) if _compact_text(heading)
+    ]
+    for heading in headings:
+        if requested in {
+            _section_key(_heading_anchor(heading)),
+            _section_key(_compact_text(heading)),
+        }:
+            return heading
+    choices = ", ".join(_compact_text(heading) for heading in headings[:10])
+    raise ValueError(f"Unknown section: {section}. Available sections: {choices}")
+
+
+def _section_fragment(
+    soup: BeautifulSoup, section: str
+) -> tuple[BeautifulSoup, dict[str, Any]]:
+    root, _ = _content_root(soup)
+    heading = _find_section(root, section)
+    level = int(heading.name[1])
+    anchor = _heading_anchor(heading)
+
+    for parent in heading.parents:
+        if parent is root:
+            break
+        if parent.name == "section" and parent.find(_HEADING_TAGS) is heading:
+            fragment = BeautifulSoup(str(parent), "html.parser")
+            return fragment, {
+                "level": level,
+                "title": _compact_text(heading),
+                "anchor": anchor,
+            }
+
+    start = (
+        heading.parent
+        if "mw-heading" in (heading.parent.get("class") or [])
+        else heading
+    )
+    fragment = BeautifulSoup("<div></div>", "html.parser")
+    container = fragment.div
+    for sibling in (start, *start.next_siblings):
+        if sibling is not start and getattr(sibling, "name", None):
+            next_heading = (
+                sibling
+                if sibling.name in _HEADING_TAGS
+                else sibling.find(_HEADING_TAGS)
+            )
+            if next_heading is not None and int(next_heading.name[1]) <= level:
+                break
+        container.append(copy(sibling))
+    return fragment, {
+        "level": level,
+        "title": _compact_text(heading),
+        "anchor": anchor,
+    }
+
+
+def _article_text(
+    soup: BeautifulSoup, section: str = ""
+) -> tuple[str, dict[str, Any] | None]:
+    _, mediawiki = _content_root(soup)
+    if not section.strip():
+        return _soup_text(soup), None
+    fragment, selected = _section_fragment(soup, section)
+    fragment_root = fragment.body or fragment
+    return _render_text(fragment_root, mediawiki), selected
+
+
+def _article_lead(soup: BeautifulSoup) -> str:
+    root, mediawiki = _content_root(soup)
+    paragraphs: list[str] = []
+    for node in root.find_all(("p", "h2")):
+        if node.name == "h2":
+            break
+        if mediawiki and _is_mediawiki_noise(node):
+            continue
+        visible = copy(node)
+        _drop_hidden(visible)
+        text = _compact_text(visible)
+        if len(text) < 40:
+            continue
+        paragraphs.append(text)
+        if len(paragraphs) >= 3 or sum(map(len, paragraphs)) >= MAX_LEAD_CHARS:
+            break
+    if paragraphs:
+        return "\n".join(paragraphs)[:MAX_LEAD_CHARS].rstrip()
+    fallback = _render_text(copy(root), mediawiki)
+    return fallback[:MAX_LEAD_CHARS].rstrip()
+
+
+def _infobox_facts(soup: BeautifulSoup) -> list[dict[str, str]]:
+    root, mediawiki = _content_root(soup)
+    if not mediawiki:
+        return []
+    facts: list[dict[str, str]] = []
+    for row in root.select("table.infobox tr"):
+        name = row.find("th", recursive=False)
+        value = row.find("td", recursive=False)
+        if name is None or value is None:
+            continue
+        visible_name = copy(name)
+        visible_value = copy(value)
+        _drop_hidden(visible_name)
+        _drop_hidden(visible_value)
+        key = _compact_text(visible_name, 200)
+        text = _compact_text(visible_value, 500)
+        if key and text:
+            facts.append({"name": key, "value": text})
+        if len(facts) >= MAX_INFOBOX_FACTS:
+            break
+    return facts
+
+
+def _reference_nodes(soup: BeautifulSoup) -> list[Any]:
+    root, mediawiki = _content_root(soup)
+    if not mediawiki:
+        return []
+    return list(root.select("ol.references > li"))
+
+
+def _reference_labels(soup: BeautifulSoup) -> dict[str, str]:
+    root, mediawiki = _content_root(soup)
+    if not mediawiki:
+        return {}
+    labels: dict[str, str] = {}
+    for marker in root.select("sup.reference, sup.mw-ref"):
+        anchor = marker.find("a", href=True)
+        if anchor is None:
+            continue
+        citation_id = unquote(urlsplit(str(anchor["href"])).fragment)
+        if not citation_id.startswith("cite_note-"):
+            continue
+        label_node = marker.select_one(".mw-reflink-text") or marker
+        label = _compact_text(label_node).strip()
+        if label.startswith("[") and label.endswith("]"):
+            label = label[1:-1].strip()
+        if label:
+            labels.setdefault(citation_id, label)
+    return labels
+
+
+def _reference_item(node: Any, labels: dict[str, str]) -> dict[str, Any]:
+    citation_id = str(node.get("id") or "")
+    links: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for anchor in node.find_all("a", href=True):
+        url = str(anchor["href"])
+        if not url.startswith(("http://", "https://")) or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        links.append({"title": _compact_text(anchor, 200), "url": url})
+        if len(links) >= MAX_REFERENCE_LINKS:
+            break
+    cleaned = copy(node)
+    _drop_hidden(cleaned)
+    for backlink in cleaned.select(".mw-cite-backlink"):
+        backlink.decompose()
+    return {
+        "citation_label": labels.get(citation_id),
+        "citation_id": citation_id,
+        "text": _compact_text(cleaned, MAX_REFERENCE_TEXT_CHARS),
+        "links": links,
+    }
 
 
 def _excerpt(text: str, query: str, max_chars: int) -> str:
@@ -439,6 +753,7 @@ def read_article(
     include_images: bool = True,
     include_links: bool = True,
     image_offset: int = 0,
+    section: str = "",
 ) -> dict[str, Any]:
     """Read article text. include_images/include_links 时附带图片列表和条目链接。"""
     selected = _select_paths(archive_id)
@@ -458,14 +773,20 @@ def read_article(
     images: list[dict[str, Any]] | None = None
     see_also: list[dict[str, Any]] | None = None
     links: list[dict[str, Any]] | None = None
+    selected_section: dict[str, Any] | None = None
+    canonical_url: str | None = None
     if "html" in item.mimetype.lower():
         soup = BeautifulSoup(content.decode("utf-8", errors="replace"), "html.parser")
+        canonical = soup.find("link", rel="canonical", href=True)
+        canonical_url = str(canonical["href"]) if canonical else None
         if include_images:
             images = _find_images(soup, entry.path)
         if include_links:
             see_also, links = _find_links(archive, soup, entry.path, name)
-        text = _soup_text(soup)
+        text, selected_section = _article_text(soup, section)
     else:
+        if section.strip():
+            raise ValueError("Sections are only available for HTML articles")
         text = _plain_text(content, item.mimetype)
     window, text_offset, next_offset = _article_window(text, query, max_chars, offset)
     result: dict[str, Any] = {
@@ -479,7 +800,17 @@ def read_article(
         "next_offset": next_offset,
         "truncated": next_offset is not None,
         "total_chars": len(text),
-        "uri": _article_uri(name, entry.path),
+        "uri": (
+            _section_uri(name, entry.path, selected_section["anchor"])
+            if selected_section
+            else _article_uri(name, entry.path)
+        ),
+        "requested_article_path": article_path,
+        "redirected": article_path != entry.path,
+        "section": selected_section,
+        "canonical_url": canonical_url,
+        "language": _archive_metadata(archive, "Language"),
+        "archive_date": _archive_metadata(archive, "Date"),
     }
     if include_images:
         images = images or []
@@ -502,6 +833,122 @@ def read_article(
         result["links"] = links
         result["total_links"] = len(see_also) + len(links)
     return result
+
+
+def inspect_article(archive_id: str, article_path: str) -> dict[str, Any]:
+    """Return a compact structural view before reading a potentially long article."""
+    selected = _select_paths(archive_id)
+    if len(selected) != 1:
+        raise ValueError("archive_id is required")
+    name, path = selected[0]
+    archive = _archive(path)
+    requested_entry = archive.get_entry_by_path(article_path)
+    requested_path = str(requested_entry.path)
+    entry = _entry(archive, article_path)
+    item = entry.get_item()
+    if item.size > MAX_ARTICLE_BYTES:
+        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+    if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
+        raise ValueError(f"Article is not text: {item.mimetype}")
+
+    content = bytes(item.content)
+    outline: list[dict[str, Any]] = []
+    facts: list[dict[str, str]] = []
+    total_sections = 0
+    total_references = 0
+    canonical_url: str | None = None
+    profile = "text"
+    if "html" in item.mimetype.lower():
+        soup = BeautifulSoup(content.decode("utf-8", errors="replace"), "html.parser")
+        _, mediawiki = _content_root(soup)
+        profile = "mediawiki" if mediawiki else "html"
+        outline, total_sections = _article_outline(soup, name, entry.path)
+        facts = _infobox_facts(soup)
+        total_references = len(_reference_nodes(soup))
+        lead = _article_lead(soup)
+        canonical = soup.find("link", rel="canonical", href=True)
+        canonical_url = str(canonical["href"]) if canonical else None
+        total_chars = len(_soup_text(soup))
+    else:
+        text = _plain_text(content, item.mimetype)
+        lead = text[:MAX_LEAD_CHARS].rstrip()
+        total_chars = len(text)
+
+    return {
+        "status": "ok",
+        "archive_id": name,
+        "requested_article_path": requested_path,
+        "article_path": entry.path,
+        "redirected": requested_path != entry.path,
+        "title": entry.title or item.title,
+        "mimetype": item.mimetype,
+        "profile": profile,
+        "lead": lead,
+        "outline": outline,
+        "total_sections": total_sections,
+        "outline_truncated": total_sections > len(outline),
+        "facts": facts,
+        "total_references": total_references,
+        "total_chars": total_chars,
+        "uri": _article_uri(name, entry.path),
+        "canonical_url": canonical_url,
+        "language": _archive_metadata(archive, "Language"),
+        "archive_date": _archive_metadata(archive, "Date"),
+    }
+
+
+def list_references(
+    archive_id: str,
+    article_path: str,
+    offset: int = 0,
+    limit: int = 20,
+    citation_label: str | None = None,
+) -> dict[str, Any]:
+    """List MediaWiki references with stable citation ids and external URLs."""
+    selected = _select_paths(archive_id)
+    if len(selected) != 1:
+        raise ValueError("archive_id is required")
+    name, path = selected[0]
+    archive = _archive(path)
+    entry = _entry(archive, article_path)
+    item = entry.get_item()
+    if item.size > MAX_ARTICLE_BYTES:
+        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+    if "html" not in item.mimetype.lower():
+        raise ValueError("References are only available for HTML articles")
+
+    soup = BeautifulSoup(
+        bytes(item.content).decode("utf-8", errors="replace"), "html.parser"
+    )
+    labels = _reference_labels(soup)
+    references = [_reference_item(node, labels) for node in _reference_nodes(soup)]
+    total_references = len(references)
+    if citation_label is not None:
+        requested_label = " ".join(str(citation_label).split()).casefold()
+        references = [
+            reference
+            for reference in references
+            if reference["citation_label"] is not None
+            and " ".join(reference["citation_label"].split()).casefold()
+            == requested_label
+        ]
+    matched_references = len(references)
+    offset = min(max(int(offset), 0), len(references))
+    limit = min(max(int(limit), 1), 50)
+    page = references[offset : offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < len(references) else None
+    return {
+        "status": "ok" if page else "no_hits",
+        "archive_id": name,
+        "article_path": entry.path,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total_references": total_references,
+        "matched_references": matched_references,
+        "citation_label": citation_label,
+        "references": page,
+        "uri": _article_uri(name, entry.path),
+    }
 
 
 MAX_SEE_ALSO_LINKS = 10
@@ -550,9 +997,16 @@ def _find_links(
     see_also: list[dict[str, Any]] = []
     body: list[dict[str, Any]] = []
     seen: set[str] = set()
+    root, mediawiki = _content_root(soup)
 
     def add(anchor, target: list[dict[str, Any]], cap: int) -> None:
         if len(target) >= cap:
+            return
+        if mediawiki and _is_mediawiki_noise(anchor):
+            return
+        if anchor.find_parent(["nav", "header", "footer", "aside"]):
+            return
+        if anchor.find_parent(class_=[name[1:] for name in _STACKEXCHANGE_NOISE]):
             return
         try:
             path = _resolve_image_path(article_path, str(anchor["href"]))
@@ -574,7 +1028,7 @@ def _find_links(
             }
         )
 
-    for h2 in soup.find_all("h2"):
+    for h2 in root.find_all("h2"):
         label = (h2.get("id") or "").replace("_", " ").strip().lower()
         if not label:
             label = h2.get_text(" ", strip=True).lower()
@@ -587,7 +1041,7 @@ def _find_links(
             break
 
     if not see_also:
-        for anchor in soup.find_all("a", href=True):
+        for anchor in root.find_all("a", href=True):
             if len(body) >= MAX_BODY_LINKS:
                 break
             add(anchor, body, MAX_BODY_LINKS)
@@ -863,6 +1317,78 @@ _TOOL_DEFINITIONS = [
         annotations=READ_ONLY,
     ),
     Tool(
+        name="inspect_article",
+        title="Inspect a ZIM article",
+        description="Inspect an article before reading it: clean lead, heading outline, MediaWiki infobox facts, redirects, and reference count.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "archive_id": {"type": "string"},
+                "article_path": {"type": "string"},
+            },
+            "required": ["archive_id", "article_path"],
+        },
+        outputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "archive_id": {"type": "string"},
+                "requested_article_path": {"type": "string"},
+                "article_path": {"type": "string"},
+                "redirected": {"type": "boolean"},
+                "title": {"type": "string"},
+                "mimetype": {"type": "string"},
+                "profile": {"type": "string", "enum": ["mediawiki", "html", "text"]},
+                "lead": {"type": "string"},
+                "outline": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "level": {"type": "integer"},
+                            "title": {"type": "string"},
+                            "anchor": {"type": "string"},
+                            "uri": {"type": "string"},
+                        },
+                        "required": ["level", "title", "anchor", "uri"],
+                    },
+                },
+                "total_sections": {"type": "integer"},
+                "outline_truncated": {"type": "boolean"},
+                "facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "value": {"type": "string"},
+                        },
+                        "required": ["name", "value"],
+                    },
+                },
+                "total_references": {"type": "integer"},
+                "total_chars": {"type": "integer"},
+                "uri": {"type": "string"},
+                "canonical_url": {"type": ["string", "null"]},
+                "language": {"type": ["string", "null"]},
+                "archive_date": {"type": ["string", "null"]},
+            },
+            "required": [
+                "status",
+                "archive_id",
+                "article_path",
+                "title",
+                "profile",
+                "lead",
+                "outline",
+                "facts",
+                "total_references",
+                "uri",
+            ],
+        },
+        annotations=READ_ONLY,
+    ),
+    Tool(
         name="read_article",
         title="Read a ZIM article",
         description="Read bounded article text with optional image metadata and related links.",
@@ -885,6 +1411,10 @@ _TOOL_DEFINITIONS = [
                     "minimum": 0,
                     "description": "Continue image metadata from a previous next_image_offset; page size is capped at 30.",
                 },
+                "section": {
+                    "type": "string",
+                    "description": "Read one heading subtree by the title or anchor returned by inspect_article.",
+                },
             },
             "required": ["archive_id", "article_path"],
         },
@@ -902,6 +1432,12 @@ _TOOL_DEFINITIONS = [
                 "truncated": {"type": "boolean"},
                 "total_chars": {"type": "integer"},
                 "uri": {"type": "string"},
+                "requested_article_path": {"type": "string"},
+                "redirected": {"type": "boolean"},
+                "section": {"type": ["object", "null"]},
+                "canonical_url": {"type": ["string", "null"]},
+                "language": {"type": ["string", "null"]},
+                "archive_date": {"type": ["string", "null"]},
                 "total_images": {"type": "integer"},
                 "image_offset": {"type": "integer"},
                 "next_image_offset": {"type": ["integer", "null"]},
@@ -956,6 +1492,82 @@ _TOOL_DEFINITIONS = [
                 "truncated",
                 "total_chars",
                 "uri",
+                "requested_article_path",
+                "redirected",
+                "section",
+                "canonical_url",
+                "language",
+                "archive_date",
+            ],
+        },
+        annotations=READ_ONLY,
+    ),
+    Tool(
+        name="list_references",
+        title="List article references",
+        description="List paginated MediaWiki citations and notes with archived external URLs; optionally select a visible marker such as '1', 'a', or 'note 1'.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "archive_id": {"type": "string"},
+                "article_path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "citation_label": {"type": "string"},
+            },
+            "required": ["archive_id", "article_path"],
+        },
+        outputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "archive_id": {"type": "string"},
+                "article_path": {"type": "string"},
+                "offset": {"type": "integer"},
+                "next_offset": {"type": ["integer", "null"]},
+                "total_references": {"type": "integer"},
+                "matched_references": {"type": "integer"},
+                "citation_label": {"type": ["string", "null"]},
+                "references": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "citation_label": {"type": ["string", "null"]},
+                            "citation_id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "links": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "title": {"type": "string"},
+                                        "url": {"type": "string"},
+                                    },
+                                    "required": ["title", "url"],
+                                },
+                            },
+                        },
+                        "required": [
+                            "citation_label",
+                            "citation_id",
+                            "text",
+                            "links",
+                        ],
+                    },
+                },
+                "uri": {"type": "string"},
+            },
+            "required": [
+                "status",
+                "archive_id",
+                "article_path",
+                "offset",
+                "total_references",
+                "matched_references",
+                "citation_label",
+                "references",
+                "uri",
             ],
         },
         annotations=READ_ONLY,
@@ -988,8 +1600,12 @@ def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
         return list_archives()
     if name == "search":
         return search(**arguments)
+    if name == "inspect_article":
+        return inspect_article(**arguments)
     if name == "read_article":
         return read_article(**arguments)
+    if name == "list_references":
+        return list_references(**arguments)
     if name == "extract_image":
         return extract_image(**arguments)
     raise ValueError(f"Unknown tool: {name}")
@@ -1006,12 +1622,6 @@ def _mcp_result(value: Any) -> CallToolResult:
     for item in value:
         content.append(_json_content(item) if isinstance(item, dict) else item)
     return CallToolResult(content=content)
-
-
-def _legacy_result(value: Any) -> Any:
-    if not isinstance(value, list):
-        return value
-    return [_json_content(item) if isinstance(item, dict) else item for item in value]
 
 
 async def _list_tools_v2(_ctx: Any, _params: Any) -> ListToolsResult:
@@ -1050,6 +1660,7 @@ def _archive_resources() -> list[Resource]:
 
 def _read_article_resource(uri: str) -> ReadResourceResult:
     archive_id, article_path = _parse_article_uri(uri)
+    section = _parse_article_section(uri)
     selected = _select_paths(archive_id)
     if len(selected) != 1:
         raise ValueError("archive_id is required")
@@ -1062,7 +1673,15 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
         raise ValueError(f"Article is not text: {item.mimetype}")
 
-    full_text = _plain_text(bytes(item.content), item.mimetype)
+    content = bytes(item.content)
+    selected_section: dict[str, Any] | None = None
+    if section:
+        if "html" not in item.mimetype.lower():
+            raise ValueError("Sections are only available for HTML articles")
+        soup = BeautifulSoup(content.decode("utf-8", errors="replace"), "html.parser")
+        full_text, selected_section = _article_text(soup, section)
+    else:
+        full_text = _plain_text(content, item.mimetype)
     truncated = len(full_text) > MAX_RESOURCE_CHARS
     text = full_text if not truncated else full_text[:MAX_RESOURCE_CHARS].rstrip()
     meta = {
@@ -1072,6 +1691,7 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
         "status": "ok",
         "total_chars": len(full_text),
         "truncated": truncated,
+        "section": selected_section,
     }
     if truncated:
         meta["next_offset_hint"] = MAX_RESOURCE_CHARS
@@ -1084,6 +1704,7 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
                 meta={
                     "truncated": truncated,
                     "next_offset_hint": meta.get("next_offset_hint"),
+                    "section": selected_section,
                 },
             )
         ],
@@ -1125,27 +1746,16 @@ async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
         )
 
 
-if "on_list_tools" in inspect.signature(Server).parameters:
-    mcp = Server(
-        "kiwix",
-        version="0.1.0",
-        instructions=MCP_INSTRUCTIONS,
-        on_list_tools=_list_tools_v2,
-        on_call_tool=_call_tool_v2,
-        on_list_resources=_list_resources_v2,
-        on_list_resource_templates=_list_resource_templates_v2,
-        on_read_resource=_read_resource_v2,
-    )
-else:
-    mcp = Server("kiwix", instructions=MCP_INSTRUCTIONS)
-
-    @mcp.list_tools()
-    async def _list_tools_v1() -> list[Tool]:
-        return _TOOL_DEFINITIONS
-
-    @mcp.call_tool()
-    async def _call_tool_v1(name: str, arguments: dict[str, Any]) -> Any:
-        return _legacy_result(_dispatch_tool(name, arguments or {}))
+mcp = Server(
+    "kiwix",
+    version="0.1.0",
+    instructions=MCP_INSTRUCTIONS,
+    on_list_tools=_list_tools_v2,
+    on_call_tool=_call_tool_v2,
+    on_list_resources=_list_resources_v2,
+    on_list_resource_templates=_list_resource_templates_v2,
+    on_read_resource=_read_resource_v2,
+)
 
 
 if __name__ == "__main__":

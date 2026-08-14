@@ -35,9 +35,16 @@ Tools:
   `auto` (default), `fulltext`, or `title`. `fulltext` is strict and fails on
   archives without full-text index; `title` forces title-only suggestion lookup.
   Optional `language` and `flavour` filter archives in cross-archive mode only.
-- `read_article`: bounded text with `next_offset` continuation, capped image
+- `inspect_article`: return a clean lead, heading outline with section URIs,
+  MediaWiki infobox facts, redirect/canonical metadata, archive language/date,
+  and reference count without returning the full article.
+- `read_article`: clean, bounded text with `next_offset` continuation, optional
+  `section` selection by title or anchor, capped image
   metadata, image metadata pagination via `image_offset`, and concise related links
   (each link/see-also entry carries a `uri` field).
+- `list_references`: page through MediaWiki citations, notes, and preserved external
+  URLs, or select a visible marker such as `1`, `a`, or `note 1` via
+  `citation_label`.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
   fallback for clients such as pi. Pass `image_path` from `read_article` when
   index 0 is not the desired image.
@@ -47,6 +54,8 @@ MCP resources (2.x):
 
 - Resource template:
   `kiwix://{archive_id}/{+article_path}`
+- Add a heading fragment to read one section, for example
+  `kiwix://archive.zim/Artificial_intelligence#Knowledge_representation`.
 - `list_resources`: returns each archive's main entry as a `text/plain` resource.
 - `read_resource`: return plain article text from a stable URI. Text is
   truncated at 50,000 characters (`MAX_RESOURCE_CHARS`); the result `meta` and
@@ -61,6 +70,8 @@ store archives elsewhere should keep setting this variable explicitly.
 
 When `read_article` returns `next_offset`, call it again with the same
 `archive_id` and `article_path` plus that `offset` to continue a long article.
+For long Wikipedia articles, call `inspect_article` first and pass a returned
+outline `anchor` as `read_article.section`.
 When it returns `next_image_offset`, call it again with the same article and
 that `image_offset` to continue a long image list.
 

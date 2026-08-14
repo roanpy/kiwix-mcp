@@ -57,6 +57,116 @@ def test_html_cleanup_and_query_excerpt() -> None:
     )
 
 
+def test_mediawiki_cleanup_keeps_article_text_and_removes_noise() -> None:
+    html = b"""
+    <main><div class="mw-parser-output">
+      <table class="sidebar"><tr><td>Navigation noise</td></tr></table>
+      <table class="infobox"><tr><th>Born</th><td>Visible fact</td></tr></table>
+      <p>Useful lead <span style="display: none">hidden value</span>[1]</p>
+      <div class="mw-heading"><h2 id="History">History</h2></div>
+      <p>Useful body</p>
+      <div class="mw-references-wrap"><ol class="references"><li>Long source</li></ol></div>
+    </div></main>
+    """
+
+    text = server._plain_text(html, "text/html")
+
+    assert text == "Useful lead [1]\nHistory\nUseful body"
+
+
+def test_generic_stackexchange_cleanup_prefers_post_content() -> None:
+    html = b"""
+    <div id="mainbar">
+      <div class="question">
+        <div class="votecell">99</div>
+        <div class="js-post-body"><p>Question body that should be read first.</p></div>
+        <div class="post-taglist">navigation tag</div>
+        <div class="post-signature">author metadata</div>
+      </div>
+      <h2>1 Answer</h2><div class="answer"><p>Useful answer.</p></div>
+    </div>
+    """
+
+    text = server._plain_text(html, "text/html")
+
+    assert text == "Question body that should be read first.\n1 Answer\nUseful answer."
+
+
+def test_wikipedia_structure_sections_references_and_resource_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = """
+    <html><head><link rel="canonical" href="https://en.wikipedia.org/wiki/Test"></head>
+    <body><main><div class="mw-parser-output">
+      <table class="infobox"><tr><th>Born</th><td><span hidden>machine</span>1900</td></tr></table>
+      <p>Lead paragraph with enough useful text for article inspection and study.
+        <sup class="reference"><a href="#cite_note-book-40"><span class="mw-reflink-text">[1]</span></a></sup>
+      </p>
+      <div class="mw-heading"><h2 id="First_section">First section</h2></div>
+      <p>First section text.
+        <sup class="reference"><a href="#cite_note-web-7"><span class="mw-reflink-text">[2]</span></a></sup>
+      </p>
+      <div class="mw-heading"><h3 id="Child">Child</h3></div><p>Child text.</p>
+      <div class="mw-heading"><h2 id="Second">Second</h2></div><p>Must not leak.</p>
+      <div class="mw-references-wrap"><ol class="references">
+        <li id="cite_note-book-40"><span class="mw-cite-backlink">^</span>Book source</li>
+        <li id="cite_note-web-7"><span class="mw-cite-backlink">^</span>
+          <a class="external" href="https://example.com/source">Web source</a>
+        </li>
+      </ol></div>
+    </div></main></body></html>
+    """
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html.encode(), title="Test"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="Test", title="Test", get_item=lambda: item
+    )
+    archive = SimpleNamespace(
+        get_entry_by_path=lambda path: entry,
+        get_metadata=lambda key: {"Language": b"eng", "Date": b"2026-01-01"}[key],
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+
+    inspected = server.inspect_article("test.zim", "Test")
+    assert inspected["profile"] == "mediawiki"
+    assert inspected["lead"].startswith("Lead paragraph")
+    assert inspected["facts"] == [{"name": "Born", "value": "1900"}]
+    assert inspected["total_sections"] == 3
+    assert inspected["outline"][0]["uri"].endswith("#First_section")
+    assert inspected["total_references"] == 2
+    assert inspected["canonical_url"] == "https://en.wikipedia.org/wiki/Test"
+    assert inspected["language"] == "eng"
+
+    article = server.read_article(
+        "test.zim",
+        "Test",
+        section="First section",
+        include_images=False,
+        include_links=False,
+    )
+    assert article["section"]["anchor"] == "First_section"
+    assert "First section text" in article["text"]
+    assert "Child text" in article["text"]
+    assert "Must not leak" not in article["text"]
+
+    references = server.list_references("test.zim", "Test", citation_label="2", limit=1)
+    assert references["total_references"] == 2
+    assert references["matched_references"] == 1
+    assert references["references"][0]["citation_label"] == "2"
+    assert references["references"][0]["links"] == [
+        {"title": "Web source", "url": "https://example.com/source"}
+    ]
+
+    resource = server._read_article_resource("kiwix://test.zim/Test#First_section")
+    assert "First section text" in resource.contents[0].text
+    assert "Must not leak" not in resource.contents[0].text
+    assert resource.meta["section"]["anchor"] == "First_section"
+
+
 def test_article_window_supports_query_and_continuation() -> None:
     text = "a" * 1200 + "needle" + "b" * 1200
     first, offset, next_offset = server._article_window(text, "needle", 1000, 0)
@@ -112,34 +222,40 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert [tool.name for tool in result.tools] == [
         "list_archives",
         "search",
+        "inspect_article",
         "read_article",
+        "list_references",
         "extract_image",
     ]
-    assert result.tools[0].output_schema is not None
+    tools = {tool.name: tool for tool in result.tools}
+    assert tools["list_archives"].output_schema is not None
     assert (
         "flavour"
-        in result.tools[0].output_schema["properties"]["archives"]["items"][
+        in tools["list_archives"].output_schema["properties"]["archives"]["items"][
             "properties"
         ]
     )
-    archive_output = result.tools[0].output_schema["properties"]["archives"]["items"][
-        "properties"
-    ]
+    archive_output = tools["list_archives"].output_schema["properties"]["archives"][
+        "items"
+    ]["properties"]
     assert {"size_bytes", "article_count", "language", "error"} <= archive_output.keys()
     assert (
         "match_type"
-        in result.tools[1].output_schema["properties"]["results"]["items"]["properties"]
+        in tools["search"].output_schema["properties"]["results"]["items"]["properties"]
     )
-    assert "mode" in result.tools[1].input_schema["properties"]
-    assert "offset" in result.tools[2].input_schema["properties"]
-    assert "image_offset" in result.tools[2].input_schema["properties"]
-    article_output = result.tools[2].output_schema["properties"]
+    assert "mode" in tools["search"].input_schema["properties"]
+    assert "outline" in tools["inspect_article"].output_schema["properties"]
+    assert "section" in tools["read_article"].input_schema["properties"]
+    assert "offset" in tools["read_article"].input_schema["properties"]
+    assert "image_offset" in tools["read_article"].input_schema["properties"]
+    article_output = tools["read_article"].output_schema["properties"]
     assert "mimetype" in article_output
     assert "images" in article_output
     assert "is_main" not in article_output["images"]["items"]["properties"]
     assert "see_also" in article_output
     assert "links" in article_output
-    assert "image_path" in result.tools[3].input_schema["properties"]
+    assert "citation_label" in tools["list_references"].input_schema["properties"]
+    assert "image_path" in tools["extract_image"].input_schema["properties"]
 
 
 def test_mcp_resource_template_is_available() -> None:
@@ -955,7 +1071,9 @@ def test_stdio_protocol_round_trip(tmp_path: Path) -> None:
     assert [tool["name"] for tool in responses[2]["result"]["tools"]] == [
         "list_archives",
         "search",
+        "inspect_article",
         "read_article",
+        "list_references",
         "extract_image",
     ]
     assert responses[3]["result"]["resources"] == []
