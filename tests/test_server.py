@@ -801,6 +801,7 @@ def test_search_can_aggregate_all_archives(
     )
 
     result = server.search("query", "*", limit=3)
+    second_page = server.search("query", "*", limit=2, offset=2)
 
     assert result["mode"] == "auto"
     assert [item["article_path"] for item in result["results"]] == ["a", "b", "c"]
@@ -811,6 +812,8 @@ def test_search_can_aggregate_all_archives(
     ]
     assert result["estimated_matches"] == 4
     assert result["next_offset"] == 3
+    assert [item["article_path"] for item in second_page["results"]] == ["c", "d"]
+    assert second_page["next_offset"] is None
 
 
 def test_read_article_caps_image_metadata(
@@ -1275,34 +1278,50 @@ def test_cross_archive_exact_title_outranks_fulltext_noise(
     result = server.search("fainting goat", "*", limit=5)
 
     assert result["results"][0]["match_type"] == "exact_title"
+    assert result["results"][0]["search_mode"] == "title"
     assert result["results"][0]["article_path"] == "Fainting_Goat"
 
 
-def test_idle_watchdog_cancels_server_task() -> None:
-    """Watchdog cancels the server task after the idle timeout elapses."""
-    import asyncio
+def test_stdio_idle_timeout_exits_real_process(tmp_path: Path) -> None:
+    env = {
+        **os.environ,
+        "KIWIX_ARCHIVE_DIR": str(tmp_path),
+        "KIWIX_MCP_IDLE_TIMEOUT": "1",
+        "KIWIX_MCP_LOG_LEVEL": "INFO",
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(Path(server.__file__))],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert process.wait(timeout=5) == 0
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        pytest.fail("stdio server did not exit after its idle timeout")
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    assert "idle for 1s, shutting down" in stderr
 
-    async def run() -> bool:
-        cancelled = False
 
-        async def fake_server() -> None:
-            nonlocal cancelled
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                cancelled = True
+def test_activity_resets_idle_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+    previous = SimpleNamespace(cancelled=False)
+    previous.cancel = lambda: setattr(previous, "cancelled", True)
+    replacement = object()
+    loop = SimpleNamespace(
+        call_later=lambda delay, callback: (
+            replacement
+            if (delay, callback) == (server._IDLE_TIMEOUT_S, server._exit_idle)
+            else None
+        )
+    )
+    monkeypatch.setattr(server, "_idle_timer", previous)
+    monkeypatch.setattr(server.asyncio, "get_running_loop", lambda: loop)
 
-        server_task = asyncio.create_task(fake_server())
-        # Pretend the last request was long ago; patch the timeout to 0s so
-        # the watchdog fires on its first check instead of sleeping.
-        server._last_activity = server.time.monotonic() - 100
-        original_timeout = server._IDLE_TIMEOUT_S
-        server._IDLE_TIMEOUT_S = 0.1
-        try:
-            await server._watchdog(server_task)
-        finally:
-            server._IDLE_TIMEOUT_S = original_timeout
-        await server_task  # let the CancelledError propagate into fake_server
-        return cancelled
+    server._reset_idle_timer()
 
-    assert asyncio.run(run()) is True
+    assert previous.cancelled is True
+    assert server._idle_timer is replacement

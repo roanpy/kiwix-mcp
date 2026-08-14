@@ -79,6 +79,11 @@ Diagnostics are off by default. Set `KIWIX_MCP_LOG_LEVEL=INFO` for stderr logs,
 or set `KIWIX_MCP_LOG_FILE=/path/to/kiwix.log` for a small rotating log (up to
 three 1 MiB files).
 
+Idle stdio processes exit after 600 seconds by default. Override this with
+`KIWIX_MCP_IDLE_TIMEOUT=<seconds>`, or set it to `0` to disable idle shutdown.
+Use idle shutdown only with an MCP client that respawns stdio servers on the
+next call.
+
 This repository currently has no project license and is not an open-source
 release. Before redistribution, choose a project license and review the
 GPL-3.0 license shipped with the `libzim` dependency.

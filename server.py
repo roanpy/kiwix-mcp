@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from copy import copy
 import fcntl
@@ -11,7 +12,6 @@ import os
 import posixpath
 import sys
 import tempfile
-import time
 from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -54,17 +54,37 @@ LOG_BACKUP_COUNT = 2
 
 _LOGGER = logging.getLogger("kiwix-mcp")
 
-# Idle shutdown: stdio clients keep the server process alive as long as their
-# session is open; sessions that never call a tool would otherwise accumulate.
-# After this many seconds without any request, the server exits cleanly and
-# the client respawns it on the next call. Set 0 to disable.
+# Idle shutdown: stdio clients keep one process per open session. After this
+# many seconds without a request, terminate this stateless child process; a
+# compatible client respawns it on the next call. Set 0 to disable.
 _IDLE_TIMEOUT_S = int(os.environ.get("KIWIX_MCP_IDLE_TIMEOUT", "600"))
-_last_activity = 0.0
+_idle_timer: asyncio.TimerHandle | None = None
 
 
-def _touch_activity() -> None:
-    global _last_activity
-    _last_activity = time.monotonic()
+def _exit_idle() -> None:
+    _LOGGER.info("idle for %ss, shutting down", _IDLE_TIMEOUT_S)
+    # ponytail: hard exit is deliberate; this process owns no persistent state,
+    # and cancelling MCP's nested stdio task can hang during SDK cleanup.
+    os._exit(0)
+
+
+def _cancel_idle_timer() -> None:
+    global _idle_timer
+    if _idle_timer is not None:
+        _idle_timer.cancel()
+        _idle_timer = None
+
+
+def _reset_idle_timer() -> None:
+    global _idle_timer
+    _cancel_idle_timer()
+    if _IDLE_TIMEOUT_S <= 0:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _idle_timer = loop.call_later(_IDLE_TIMEOUT_S, _exit_idle)
 
 
 MCP_INSTRUCTIONS = (
@@ -777,9 +797,7 @@ def search(
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append({"archive_id": name, "error": str(exc)})
             continue
-        item["search_mode"] = (
-            "fulltext" if match_type in {"exact_title", "fulltext"} else "title"
-        )
+        item["search_mode"] = "fulltext" if match_type == "fulltext" else "title"
         item["match_type"] = match_type
         if matched_query != query:
             item["matched_query"] = matched_query
@@ -4726,8 +4744,11 @@ def _mcp_result(value: Any) -> CallToolResult:
 
 
 async def _list_tools_v2(_ctx: Any, _params: Any) -> ListToolsResult:
-    _touch_activity()
-    return ListToolsResult(tools=_TOOL_DEFINITIONS)
+    _cancel_idle_timer()
+    try:
+        return ListToolsResult(tools=_TOOL_DEFINITIONS)
+    finally:
+        _reset_idle_timer()
 
 
 def _archive_resources() -> list[Resource]:
@@ -4815,34 +4836,43 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
 
 
 async def _list_resources_v2(_ctx: Any, _params: Any) -> ListResourcesResult:
-    _touch_activity()
-    return ListResourcesResult(resources=_archive_resources())
+    _cancel_idle_timer()
+    try:
+        return ListResourcesResult(resources=_archive_resources())
+    finally:
+        _reset_idle_timer()
 
 
 async def _list_resource_templates_v2(
     _ctx: Any, _params: Any
 ) -> ListResourceTemplatesResult:
-    _touch_activity()
-    return ListResourceTemplatesResult(
-        resourceTemplates=[
-            ResourceTemplate(
-                name="kiwix-article",
-                title="Kiwix article",
-                uriTemplate="kiwix://{archive_id}/{+article_path}",
-                description="Read article content from a ZIM archive.",
-                mimeType="text/plain",
-            )
-        ]
-    )
+    _cancel_idle_timer()
+    try:
+        return ListResourceTemplatesResult(
+            resourceTemplates=[
+                ResourceTemplate(
+                    name="kiwix-article",
+                    title="Kiwix article",
+                    uriTemplate="kiwix://{archive_id}/{+article_path}",
+                    description="Read article content from a ZIM archive.",
+                    mimeType="text/plain",
+                )
+            ]
+        )
+    finally:
+        _reset_idle_timer()
 
 
 async def _read_resource_v2(_ctx: Any, params: Any) -> ReadResourceResult:
-    _touch_activity()
-    return _read_article_resource(params.uri)
+    _cancel_idle_timer()
+    try:
+        return _read_article_resource(params.uri)
+    finally:
+        _reset_idle_timer()
 
 
 async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
-    _touch_activity()
+    _cancel_idle_timer()
     try:
         return _mcp_result(_dispatch_tool(params.name, params.arguments or {}))
     except Exception as exc:
@@ -4850,6 +4880,8 @@ async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
         return CallToolResult(
             content=[TextContent(type="text", text=str(exc))], isError=True
         )
+    finally:
+        _reset_idle_timer()
 
 
 mcp = Server(
@@ -4864,19 +4896,6 @@ mcp = Server(
 )
 
 
-async def _watchdog(server_task: "asyncio.Task") -> None:
-    """Cancel the server task after the idle timeout elapses."""
-    import asyncio
-
-    while True:
-        await asyncio.sleep(min(_IDLE_TIMEOUT_S, 30))
-        idle_for = time.monotonic() - _last_activity
-        if _last_activity and idle_for >= _IDLE_TIMEOUT_S:
-            _LOGGER.info("idle for %.0fs, shutting down", idle_for)
-            server_task.cancel()
-            return
-
-
 if __name__ == "__main__":
     # libzim/Xapian writes diagnostics directly to fd 1. Keep JSON-RPC on a
     # duplicate of the original stdout and send native diagnostics to stderr.
@@ -4884,25 +4903,15 @@ if __name__ == "__main__":
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = protocol_stdout
     _configure_logging()
-    import asyncio
 
     async def _run() -> None:
         async with stdio_server() as (read_stream, write_stream):
-            _touch_activity()
-            server_task = asyncio.create_task(
-                mcp.run(read_stream, write_stream, mcp.create_initialization_options())
-            )
-            watchdog = (
-                asyncio.create_task(_watchdog(server_task))
-                if _IDLE_TIMEOUT_S > 0
-                else None
-            )
+            _reset_idle_timer()
             try:
-                await server_task
-            except asyncio.CancelledError:
-                pass
+                await mcp.run(
+                    read_stream, write_stream, mcp.create_initialization_options()
+                )
             finally:
-                if watchdog is not None:
-                    watchdog.cancel()
+                _cancel_idle_timer()
 
     asyncio.run(_run())
