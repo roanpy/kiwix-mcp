@@ -737,6 +737,9 @@ def search(
                 raise
             errors.append({"archive_id": name, "error": str(exc)})
     matches = exact_matches + other_matches
+    # Cross-archive: exact_title must outrank fulltext noise from other
+    # archives, not just within its own archive's batch.
+    matches.sort(key=lambda m: 0 if m[3] == "exact_title" else 1)
     page_matches = matches[offset : offset + limit]
     results: list[dict[str, Any]] = []
     for archive, name, article_path, match_type, matched_query in page_matches:
