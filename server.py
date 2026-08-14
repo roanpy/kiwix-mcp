@@ -87,6 +87,39 @@ def _reset_idle_timer() -> None:
     _idle_timer = loop.call_later(_IDLE_TIMEOUT_S, _exit_idle)
 
 
+class _ActivityReadStream:
+    """Reset the idle timer for every inbound MCP frame."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    async def receive(self) -> Any:
+        item = await self._stream.receive()
+        _reset_idle_timer()
+        return item
+
+    def __aiter__(self) -> _ActivityReadStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        item = await self._stream.__anext__()
+        _reset_idle_timer()
+        return item
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    async def __aenter__(self) -> _ActivityReadStream:
+        await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._stream.__aexit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
 MCP_INSTRUCTIONS = (
     "Search and read local ZIM archives. Use list_archives and choose archive_id "
     "by language and collection: prefer full archives for coverage and maxi archives "
@@ -4744,11 +4777,7 @@ def _mcp_result(value: Any) -> CallToolResult:
 
 
 async def _list_tools_v2(_ctx: Any, _params: Any) -> ListToolsResult:
-    _cancel_idle_timer()
-    try:
-        return ListToolsResult(tools=_TOOL_DEFINITIONS)
-    finally:
-        _reset_idle_timer()
+    return ListToolsResult(tools=_TOOL_DEFINITIONS)
 
 
 def _archive_resources() -> list[Resource]:
@@ -4836,43 +4865,30 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
 
 
 async def _list_resources_v2(_ctx: Any, _params: Any) -> ListResourcesResult:
-    _cancel_idle_timer()
-    try:
-        return ListResourcesResult(resources=_archive_resources())
-    finally:
-        _reset_idle_timer()
+    return ListResourcesResult(resources=_archive_resources())
 
 
 async def _list_resource_templates_v2(
     _ctx: Any, _params: Any
 ) -> ListResourceTemplatesResult:
-    _cancel_idle_timer()
-    try:
-        return ListResourceTemplatesResult(
-            resourceTemplates=[
-                ResourceTemplate(
-                    name="kiwix-article",
-                    title="Kiwix article",
-                    uriTemplate="kiwix://{archive_id}/{+article_path}",
-                    description="Read article content from a ZIM archive.",
-                    mimeType="text/plain",
-                )
-            ]
-        )
-    finally:
-        _reset_idle_timer()
+    return ListResourceTemplatesResult(
+        resourceTemplates=[
+            ResourceTemplate(
+                name="kiwix-article",
+                title="Kiwix article",
+                uriTemplate="kiwix://{archive_id}/{+article_path}",
+                description="Read article content from a ZIM archive.",
+                mimeType="text/plain",
+            )
+        ]
+    )
 
 
 async def _read_resource_v2(_ctx: Any, params: Any) -> ReadResourceResult:
-    _cancel_idle_timer()
-    try:
-        return _read_article_resource(params.uri)
-    finally:
-        _reset_idle_timer()
+    return _read_article_resource(params.uri)
 
 
 async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
-    _cancel_idle_timer()
     try:
         return _mcp_result(_dispatch_tool(params.name, params.arguments or {}))
     except Exception as exc:
@@ -4880,8 +4896,6 @@ async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
         return CallToolResult(
             content=[TextContent(type="text", text=str(exc))], isError=True
         )
-    finally:
-        _reset_idle_timer()
 
 
 mcp = Server(
@@ -4909,7 +4923,9 @@ if __name__ == "__main__":
             _reset_idle_timer()
             try:
                 await mcp.run(
-                    read_stream, write_stream, mcp.create_initialization_options()
+                    _ActivityReadStream(read_stream),
+                    write_stream,
+                    mcp.create_initialization_options(),
                 )
             finally:
                 _cancel_idle_timer()

@@ -81,6 +81,7 @@ three 1 MiB files).
 
 Idle stdio processes exit after 600 seconds by default. Override this with
 `KIWIX_MCP_IDLE_TIMEOUT=<seconds>`, or set it to `0` to disable idle shutdown.
+Any inbound MCP message, including initialization and ping, resets the timer.
 Use idle shutdown only with an MCP client that respawns stdio servers on the
 next call.
 

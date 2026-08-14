@@ -1032,6 +1032,7 @@ def test_stdio_protocol_round_trip(tmp_path: Path) -> None:
             },
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
         {
@@ -1041,7 +1042,11 @@ def test_stdio_protocol_round_trip(tmp_path: Path) -> None:
             "params": {"name": "list_archives", "arguments": {}},
         },
     ]
-    env = {**os.environ, "KIWIX_ARCHIVE_DIR": str(tmp_path)}
+    env = {
+        **os.environ,
+        "KIWIX_ARCHIVE_DIR": str(tmp_path),
+        "KIWIX_MCP_IDLE_TIMEOUT": "3",
+    }
     process = subprocess.Popen(
         [sys.executable, str(Path(server.__file__))],
         stdin=subprocess.PIPE,
@@ -1073,6 +1078,7 @@ def test_stdio_protocol_round_trip(tmp_path: Path) -> None:
     assert returncode == 0, stderr
 
     assert responses[1]["result"]["protocolVersion"] == "2025-11-25"
+    assert responses[5]["result"] == {}
     assert [tool["name"] for tool in responses[2]["result"]["tools"]] == [
         "list_archives",
         "search",
@@ -1325,3 +1331,21 @@ def test_activity_resets_idle_timer(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert previous.cancelled is True
     assert server._idle_timer is replacement
+
+
+def test_inbound_frame_resets_idle_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    class ReadStream:
+        async def receive(self):
+            return "initialize"
+
+    def reset() -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(server, "_reset_idle_timer", reset)
+    wrapped = server._ActivityReadStream(ReadStream())
+
+    assert asyncio.run(wrapped.receive()) == "initialize"
+    assert calls == 1
