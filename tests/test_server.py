@@ -1212,3 +1212,67 @@ def test_reverse_map_drops_ambiguous_simplified_chars() -> None:
     # 發 and 髮 both map to 发, so 发 must not reverse-map at all
     assert "发" not in reverse
     assert reverse.get("国") == "國"
+
+
+def test_cross_archive_exact_title_outranks_fulltext_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-archive search: exact_title from any archive must rank above
+    fulltext hits from other archives, regardless of archive order."""
+    wiki_archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_title_index=True,
+        has_entry_by_title=lambda query: query == "Fainting goat",
+        get_entry_by_title=lambda query: SimpleNamespace(path="A/Fainting_goat"),
+    )
+    wikibooks_archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_title_index=False,
+        has_entry_by_title=lambda query: False,
+    )
+
+    def select_paths(archive_id: str):
+        return [
+            ("wikibooks_en_all_maxi_2026-04.zim", Path("wikibooks.zim")),
+            ("wikipedia_en_all_nopic_2026-06.zim", Path("wikipedia.zim")),
+        ]
+
+    fulltext_result = SimpleNamespace(
+        getResults=lambda start, limit: [
+            "Goats/Breeds",
+            "Goats/Printable_version",
+            "Goats/Introduction",
+        ],
+        getEstimatedMatches=lambda: 3,
+    )
+    suggest_result = SimpleNamespace(
+        getResults=lambda start, limit: ["Fainting_Goat", "Fainting_goat_syndrome"],
+        getEstimatedMatches=lambda: 2,
+    )
+
+    monkeypatch.setattr(server, "_select_paths", select_paths)
+    monkeypatch.setattr(
+        server,
+        "_archive",
+        lambda path: wiki_archive if "wikipedia" in str(path) else wikibooks_archive,
+    )
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: fulltext_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda archive: SimpleNamespace(suggest=lambda query: suggest_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("fainting goat", "*", limit=5)
+
+    assert result["results"][0]["match_type"] == "exact_title"
+    assert result["results"][0]["article_path"] == "Fainting_Goat"

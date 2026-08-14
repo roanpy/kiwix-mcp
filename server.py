@@ -704,11 +704,26 @@ def search(
                 else:
                     search_result = Searcher(archive).search(Query().set_query(variant))
                     search_mode = "fulltext"
-                exact_path = (
-                    archive.get_entry_by_title(variant).path
-                    if archive.has_entry_by_title(variant)
-                    else None
-                )
+                # SuggestionSearcher is case-insensitive; get_entry_by_title
+                # is not. Use suggest for exact detection so lowercase input
+                # hits capitalized titles.
+                exact_path = None
+                if getattr(archive, "has_title_index", False):
+                    suggest_result = SuggestionSearcher(archive).suggest(variant)
+                    suggested = list(suggest_result.getResults(0, 1))
+                    if suggested:
+                        suggested_path = str(suggested[0])
+                        if (
+                            suggested_path.replace("_", " ").casefold()
+                            == variant.casefold()
+                        ):
+                            exact_path = suggested_path
+                if exact_path is None:
+                    exact_path = (
+                        str(archive.get_entry_by_title(variant).path)
+                        if archive.has_entry_by_title(variant)
+                        else None
+                    )
                 estimate = search_result.getEstimatedMatches()
                 if estimate is not None and variant == query:
                     estimated_matches += int(estimate)
