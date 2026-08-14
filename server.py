@@ -11,6 +11,7 @@ import os
 import posixpath
 import sys
 import tempfile
+import time
 from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -52,6 +53,19 @@ MAX_LOG_BYTES = 1 * 1024 * 1024
 LOG_BACKUP_COUNT = 2
 
 _LOGGER = logging.getLogger("kiwix-mcp")
+
+# Idle shutdown: stdio clients keep the server process alive as long as their
+# session is open; sessions that never call a tool would otherwise accumulate.
+# After this many seconds without any request, the server exits cleanly and
+# the client respawns it on the next call. Set 0 to disable.
+_IDLE_TIMEOUT_S = int(os.environ.get("KIWIX_MCP_IDLE_TIMEOUT", "600"))
+_last_activity = 0.0
+
+
+def _touch_activity() -> None:
+    global _last_activity
+    _last_activity = time.monotonic()
+
 
 MCP_INSTRUCTIONS = (
     "Search and read local ZIM archives. Use list_archives and choose archive_id "
@@ -4712,6 +4726,7 @@ def _mcp_result(value: Any) -> CallToolResult:
 
 
 async def _list_tools_v2(_ctx: Any, _params: Any) -> ListToolsResult:
+    _touch_activity()
     return ListToolsResult(tools=_TOOL_DEFINITIONS)
 
 
@@ -4800,12 +4815,14 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
 
 
 async def _list_resources_v2(_ctx: Any, _params: Any) -> ListResourcesResult:
+    _touch_activity()
     return ListResourcesResult(resources=_archive_resources())
 
 
 async def _list_resource_templates_v2(
     _ctx: Any, _params: Any
 ) -> ListResourceTemplatesResult:
+    _touch_activity()
     return ListResourceTemplatesResult(
         resourceTemplates=[
             ResourceTemplate(
@@ -4820,10 +4837,12 @@ async def _list_resource_templates_v2(
 
 
 async def _read_resource_v2(_ctx: Any, params: Any) -> ReadResourceResult:
+    _touch_activity()
     return _read_article_resource(params.uri)
 
 
 async def _call_tool_v2(_ctx: Any, params: Any) -> CallToolResult:
+    _touch_activity()
     try:
         return _mcp_result(_dispatch_tool(params.name, params.arguments or {}))
     except Exception as exc:
@@ -4845,6 +4864,19 @@ mcp = Server(
 )
 
 
+async def _watchdog(server_task: "asyncio.Task") -> None:
+    """Cancel the server task after the idle timeout elapses."""
+    import asyncio
+
+    while True:
+        await asyncio.sleep(min(_IDLE_TIMEOUT_S, 30))
+        idle_for = time.monotonic() - _last_activity
+        if _last_activity and idle_for >= _IDLE_TIMEOUT_S:
+            _LOGGER.info("idle for %.0fs, shutting down", idle_for)
+            server_task.cancel()
+            return
+
+
 if __name__ == "__main__":
     # libzim/Xapian writes diagnostics directly to fd 1. Keep JSON-RPC on a
     # duplicate of the original stdout and send native diagnostics to stderr.
@@ -4856,8 +4888,21 @@ if __name__ == "__main__":
 
     async def _run() -> None:
         async with stdio_server() as (read_stream, write_stream):
-            await mcp.run(
-                read_stream, write_stream, mcp.create_initialization_options()
+            _touch_activity()
+            server_task = asyncio.create_task(
+                mcp.run(read_stream, write_stream, mcp.create_initialization_options())
             )
+            watchdog = (
+                asyncio.create_task(_watchdog(server_task))
+                if _IDLE_TIMEOUT_S > 0
+                else None
+            )
+            try:
+                await server_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
 
     asyncio.run(_run())

@@ -1276,3 +1276,33 @@ def test_cross_archive_exact_title_outranks_fulltext_noise(
 
     assert result["results"][0]["match_type"] == "exact_title"
     assert result["results"][0]["article_path"] == "Fainting_Goat"
+
+
+def test_idle_watchdog_cancels_server_task() -> None:
+    """Watchdog cancels the server task after the idle timeout elapses."""
+    import asyncio
+
+    async def run() -> bool:
+        cancelled = False
+
+        async def fake_server() -> None:
+            nonlocal cancelled
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled = True
+
+        server_task = asyncio.create_task(fake_server())
+        # Pretend the last request was long ago; patch the timeout to 0s so
+        # the watchdog fires on its first check instead of sleeping.
+        server._last_activity = server.time.monotonic() - 100
+        original_timeout = server._IDLE_TIMEOUT_S
+        server._IDLE_TIMEOUT_S = 0.1
+        try:
+            await server._watchdog(server_task)
+        finally:
+            server._IDLE_TIMEOUT_S = original_timeout
+        await server_task  # let the CancelledError propagate into fake_server
+        return cancelled
+
+    assert asyncio.run(run()) is True
