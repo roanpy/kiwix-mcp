@@ -3922,12 +3922,34 @@ def _simplified(query: str) -> str:
     return "".join(_TRADITIONAL_TO_SIMPLIFIED.get(char, char) for char in query)
 
 
+@lru_cache(maxsize=1)
+def _simplified_to_traditional() -> dict[str, str]:
+    """Reverse map for simplified input; only defined where unambiguous."""
+    reverse: dict[str, str] = {}
+    for trad, simp in _TRADITIONAL_TO_SIMPLIFIED.items():
+        if simp not in reverse:
+            reverse[simp] = trad
+        else:
+            # ambiguous reverse (e.g. 发→發/髮): don't guess
+            reverse.pop(simp, None)
+    return reverse
+
+
+def _traditional(query: str) -> str:
+    reverse = _simplified_to_traditional()
+    return "".join(reverse.get(char, char) for char in query)
+
+
 def _query_variants(query: str) -> list[str]:
-    """Query plus a simplified-Chinese variant for traditional input."""
+    """Query plus a simplified or traditional Chinese variant."""
     variants = [query]
     simplified = _simplified(query)
     if simplified != query:
         variants.append(simplified)
+        return variants
+    traditional = _traditional(query)
+    if traditional != query:
+        variants.append(traditional)
     return variants
 
 

@@ -1198,6 +1198,17 @@ def test_search_traditional_query_matches_simplified_title(
 
 
 def test_query_variants_only_differ_for_traditional() -> None:
-    assert server._query_variants("艾伦·图灵") == ["艾伦·图灵"]
     assert server._query_variants("圖靈") == ["圖靈", "图灵"]
+    assert server._query_variants("艾伦·图灵") == ["艾伦·图灵", "艾倫·圖靈"]
+    assert server._query_variants("1518年法国舞蹈瘟疫") == [
+        "1518年法国舞蹈瘟疫",
+        "1518年法國舞蹈瘟疫",
+    ]
     assert server._query_variants("Alan Turing") == ["Alan Turing"]
+
+
+def test_reverse_map_drops_ambiguous_simplified_chars() -> None:
+    reverse = server._simplified_to_traditional()
+    # 發 and 髮 both map to 发, so 发 must not reverse-map at all
+    assert "发" not in reverse
+    assert reverse.get("国") == "國"
