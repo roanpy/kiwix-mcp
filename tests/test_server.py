@@ -397,6 +397,7 @@ def test_image_metadata_uses_caption_and_dimensions() -> None:
         "caption": "Useful caption",
         "width": 250,
         "height": 166,
+        "primary": True,
     }
 
 
@@ -407,7 +408,7 @@ def test_links_prefer_see_also_and_fallback_to_body() -> None:
         '<ul><li><a href="related">Related</a></li></ul><h2>References</h2>',
         "html.parser",
     )
-    see_also, links = server._find_links(archive, soup, "article", "en_all.zim")
+    see_also, links, notes = server._find_links(archive, soup, "article", "en_all.zim")
     assert see_also == [
         {
             "article_path": "related",
@@ -416,8 +417,9 @@ def test_links_prefer_see_also_and_fallback_to_body() -> None:
         }
     ]
     assert links == []
+    assert notes == []
 
-    see_also, links = server._find_links(
+    see_also, links, notes = server._find_links(
         archive,
         server.BeautifulSoup('<a href="body">Body</a>', "html.parser"),
         "article",
@@ -907,7 +909,7 @@ def test_links_recognize_extended_see_also_labels() -> None:
         "<h2>References</h2>",
         "html.parser",
     )
-    see_also, links = server._find_links(archive, soup, "article", "zh_all.zim")
+    see_also, links, _ = server._find_links(archive, soup, "article", "zh_all.zim")
     assert see_also == [
         {
             "article_path": "extra",
@@ -925,7 +927,7 @@ def test_links_do_not_treat_references_as_see_also() -> None:
         "html.parser",
     )
 
-    see_also, links = server._find_links(archive, soup, "article", "zh_all.zim")
+    see_also, links, _ = server._find_links(archive, soup, "article", "zh_all.zim")
 
     assert see_also == []
     assert links[0]["article_path"] == "source"
@@ -1108,3 +1110,94 @@ for index in range(20):
         len([path for path in tmp_path.iterdir() if path.name != ".lock"])
         <= server.MAX_TEMP_IMAGES
     )
+
+
+def test_hatnotes_are_removed_from_text_and_lead() -> None:
+    html = b"""
+    <main><div class="mw-parser-output">
+      <div class="hatnote">"Turing" redirects here. For other uses, see
+        <a href="A/Turing_(disambiguation)">Turing (disambiguation)</a>.</div>
+      <p>Alan Mathison Turing was an English mathematician, computer
+        scientist, logician, cryptanalyst, philosopher and theoretical
+        biologist who formalised computation.</p>
+    </div></main>
+    """
+    soup = server.BeautifulSoup(html, "html.parser")
+
+    text = server._plain_text(html, "text/html")
+    assert "redirects here" not in text
+    assert text.startswith("Alan Mathison Turing")
+
+    lead = server._article_lead(soup)
+    assert "redirects here" not in lead
+    assert lead.startswith("Alan Mathison Turing")
+
+
+def test_hatnote_links_are_exposed_as_notes() -> None:
+    archive = SimpleNamespace(has_entry_by_path=lambda path: True)
+    soup = server.BeautifulSoup(
+        '<div class="mw-parser-output">'
+        '<div class="hatnote">主条目：<a href="./图灵测试">图灵测试</a></div>'
+        "<p>Body</p></div>",
+        "html.parser",
+    )
+    _, _, notes = server._find_links(archive, soup, "A/图灵", "zh_all.zim")
+    assert len(notes) == 1
+    assert notes[0]["label"].startswith("主条目")
+    assert notes[0]["links"][0]["article_path"] == "A/图灵测试"
+
+
+def test_find_images_dedupes_and_drops_tiny_icons() -> None:
+    soup = server.BeautifulSoup(
+        '<img src="header.jpg" width="250" height="200">'
+        '<img src="flag.png" width="22" height="22">'
+        '<img src="flag.png" width="22" height="22">'
+        '<img src="lock.png" width="9" height="9" alt="freely accessible">'
+        '<img src="header.jpg" width="250" height="200">'
+        '<img src="statue.jpg" width="200" height="150">',
+        "html.parser",
+    )
+    images = server._find_images(soup, "A/Topic")
+    assert [img["filename"] for img in images] == ["header.jpg", "statue.jpg"]
+    assert images[0]["primary"] is True
+    assert images[1]["primary"] is False
+    assert [img["index"] for img in images] == [0, 1]
+
+
+def test_search_traditional_query_matches_simplified_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: query == "图灵机",
+        get_entry_by_title=lambda query: SimpleNamespace(path="A/图灵机"),
+    )
+    search_result = SimpleNamespace(
+        getResults=lambda start, limit: ["A/图灵机"],
+        getEstimatedMatches=lambda: 1,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("zh_all.zim", Path("zh_all.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: search_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("圖靈機", "zh_all.zim")
+
+    assert result["results"][0]["match_type"] == "exact_title"
+    assert result["results"][0]["matched_query"] == "图灵机"
+
+
+def test_query_variants_only_differ_for_traditional() -> None:
+    assert server._query_variants("艾伦·图灵") == ["艾伦·图灵"]
+    assert server._query_variants("圖靈") == ["圖靈", "图灵"]
+    assert server._query_variants("Alan Turing") == ["Alan Turing"]

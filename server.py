@@ -59,7 +59,8 @@ MCP_INSTRUCTIONS = (
     "when images matter; use title, date, and description to break ties. "
     "For long Wikipedia articles, call inspect_article first, then read_article with "
     "a returned section anchor. Use list_references when a claim needs provenance. "
-    "For images, inspect read_article metadata and prefer image_path over index 0. "
+    "For images, inspect read_article metadata and prefer the image with "
+    "primary=True; use its image_path with extract_image instead of index 0. "
     "For cross-archive comparison, call search with archive_id='*'. "
     "Ask only when the user's goal leaves the choice ambiguous. "
     "For bilingual Wikipedia research, translate the search query into each archive's "
@@ -224,6 +225,7 @@ _MEDIAWIKI_NOISE = (
     ".reflist",
     "ol.references",
     ".mw-editsection",
+    ".mw-empty-elt",
     "#toc",
     ".toc",
     "#catlinks",
@@ -231,6 +233,7 @@ _MEDIAWIKI_NOISE = (
     ".printfooter",
     ".noprint",
 )
+_HATNOTE_SELECTOR = ".hatnote, .dablink, .rellink"
 _STACKEXCHANGE_NOISE = (
     ".votecell",
     ".post-signature",
@@ -262,6 +265,9 @@ def _render_text(root: Any, mediawiki: bool) -> str:
         if node.parent is not None:
             node.decompose()
     _drop_hidden(root)
+    for node in list(root.select(_HATNOTE_SELECTOR)):
+        if node.parent is not None:
+            node.decompose()
     if mediawiki:
         for node in list(root.select(", ".join(_MEDIAWIKI_NOISE))):
             if node.parent is not None:
@@ -436,6 +442,10 @@ def _article_lead(soup: BeautifulSoup) -> str:
             continue
         visible = copy(node)
         _drop_hidden(visible)
+        # A hatnote ("X redirects here", "主条目：…") wrapped in a <p> is
+        # navigation chrome, not lead prose.
+        for hatnote in visible.select(_HATNOTE_SELECTOR):
+            hatnote.decompose()
         text = _compact_text(visible)
         if len(text) < 40:
             continue
@@ -667,49 +677,61 @@ def search(
                 return False
         return True
 
-    exact_matches: list[tuple[Archive, str, str, str]] = []
-    other_matches: list[tuple[Archive, str, str, str]] = []
+    exact_matches: list[tuple[Archive, str, str, str, str]] = []
+    other_matches: list[tuple[Archive, str, str, str, str]] = []
     errors: list[dict[str, str]] = []
     estimated_matches = 0
     estimated_known = False
+    query_variants = _query_variants(query)
+    exact_seen: set[tuple[str, str]] = set()
+    other_seen: set[tuple[str, str]] = set()
     for name, path in selected:
         try:
             archive = _archive(path)
             if not _archive_matches(archive):
                 continue
-            if mode == "fulltext":
-                if not archive.has_fulltext_index:
-                    raise ValueError(
-                        f"Archive does not support full-text search: {name}"
+            for variant in query_variants:
+                if mode == "fulltext":
+                    if not archive.has_fulltext_index:
+                        raise ValueError(
+                            f"Archive does not support full-text search: {name}"
+                        )
+                    search_result = Searcher(archive).search(Query().set_query(variant))
+                    search_mode = "fulltext"
+                elif mode == "title" or not archive.has_fulltext_index:
+                    search_result = SuggestionSearcher(archive).suggest(variant)
+                    search_mode = "title"
+                else:
+                    search_result = Searcher(archive).search(Query().set_query(variant))
+                    search_mode = "fulltext"
+                exact_path = (
+                    archive.get_entry_by_title(variant).path
+                    if archive.has_entry_by_title(variant)
+                    else None
+                )
+                estimate = search_result.getEstimatedMatches()
+                if estimate is not None and variant == query:
+                    estimated_matches += int(estimate)
+                    estimated_known = True
+                found = search_result.getResults(0, offset + limit + 1)
+                if exact_path:
+                    exact_path = str(exact_path)
+                    if (name, exact_path) not in exact_seen:
+                        exact_seen.add((name, exact_path))
+                        exact_matches.append(
+                            (archive, name, exact_path, "exact_title", variant)
+                        )
+                for article_path in found:
+                    article_path = str(article_path)
+                    if (name, article_path) in exact_seen or (
+                        name,
+                        article_path,
+                    ) in other_seen:
+                        continue
+                    other_seen.add((name, article_path))
+                    other_matches.append(
+                        (archive, name, article_path, search_mode, variant)
                     )
-                search_result = Searcher(archive).search(Query().set_query(query))
-                search_mode = "fulltext"
-            elif mode == "title" or not archive.has_fulltext_index:
-                search_result = SuggestionSearcher(archive).suggest(query)
-                search_mode = "title"
-            else:
-                search_result = Searcher(archive).search(Query().set_query(query))
-                search_mode = "fulltext"
-            exact_path = (
-                archive.get_entry_by_title(query).path
-                if archive.has_entry_by_title(query)
-                else None
-            )
-            estimate = search_result.getEstimatedMatches()
-            if estimate is not None:
-                estimated_matches += int(estimate)
-                estimated_known = True
-            found = search_result.getResults(0, offset + limit + 1)
-            seen: set[str] = set()
-            if exact_path:
-                exact_matches.append((archive, name, str(exact_path), "exact_title"))
-                seen.add(str(exact_path))
-            for article_path in found:
-                article_path = str(article_path)
-                if article_path in seen:
-                    continue
-                seen.add(article_path)
-                other_matches.append((archive, name, article_path, search_mode))
         except (OSError, RuntimeError, ValueError) as exc:
             if mode == "fulltext":
                 raise
@@ -717,7 +739,7 @@ def search(
     matches = exact_matches + other_matches
     page_matches = matches[offset : offset + limit]
     results: list[dict[str, Any]] = []
-    for archive, name, article_path, match_type in page_matches:
+    for archive, name, article_path, match_type, matched_query in page_matches:
         try:
             item = _article_summary(archive, name, article_path, query)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -727,6 +749,8 @@ def search(
             "fulltext" if match_type in {"exact_title", "fulltext"} else "title"
         )
         item["match_type"] = match_type
+        if matched_query != query:
+            item["matched_query"] = matched_query
         results.append(item)
     has_more = len(matches) > offset + len(page_matches)
     return {
@@ -773,6 +797,7 @@ def read_article(
     images: list[dict[str, Any]] | None = None
     see_also: list[dict[str, Any]] | None = None
     links: list[dict[str, Any]] | None = None
+    notes: list[dict[str, Any]] | None = None
     selected_section: dict[str, Any] | None = None
     canonical_url: str | None = None
     if "html" in item.mimetype.lower():
@@ -782,7 +807,7 @@ def read_article(
         if include_images:
             images = _find_images(soup, entry.path)
         if include_links:
-            see_also, links = _find_links(archive, soup, entry.path, name)
+            see_also, links, notes = _find_links(archive, soup, entry.path, name)
         text, selected_section = _article_text(soup, section)
     else:
         if section.strip():
@@ -831,6 +856,7 @@ def read_article(
         links = links or []
         result["see_also"] = see_also
         result["links"] = links
+        result["notes"] = notes or []
         result["total_links"] = len(see_also) + len(links)
     return result
 
@@ -953,6 +979,155 @@ def list_references(
 
 MAX_SEE_ALSO_LINKS = 10
 MAX_BODY_LINKS = 15
+
+# ponytail: ~150 common Traditional->Simplified pairs, not full OpenCC.
+# Covers high-frequency title/query characters; extend the map if misses
+# appear in real use. Dependency-free by design.
+_TRADITIONAL_TO_SIMPLIFIED = {
+    "愛": "爱",
+    "辦": "办",
+    "邊": "边",
+    "標": "标",
+    "別": "别",
+    "參": "参",
+    "層": "层",
+    "產": "产",
+    "長": "长",
+    "場": "场",
+    "車": "车",
+    "稱": "称",
+    "衝": "冲",
+    "處": "处",
+    "傳": "传",
+    "創": "创",
+    "達": "达",
+    "帶": "带",
+    "單": "单",
+    "當": "当",
+    "導": "导",
+    "燈": "灯",
+    "點": "点",
+    "電": "电",
+    "動": "动",
+    "斷": "断",
+    "對": "对",
+    "發": "发",
+    "範": "范",
+    "費": "费",
+    "複": "复",
+    "復": "复",
+    "幹": "干",
+    "個": "个",
+    "給": "给",
+    "構": "构",
+    "關": "关",
+    "廣": "广",
+    "國": "国",
+    "過": "过",
+    "還": "还",
+    "華": "华",
+    "畫": "画",
+    "會": "会",
+    "機": "机",
+    "極": "极",
+    "際": "际",
+    "濟": "济",
+    "價": "价",
+    "簡": "简",
+    "檢": "检",
+    "見": "见",
+    "階": "阶",
+    "經": "经",
+    "舉": "举",
+    "據": "据",
+    "決": "决",
+    "開": "开",
+    "庫": "库",
+    "況": "况",
+    "來": "来",
+    "蘭": "兰",
+    "類": "类",
+    "離": "离",
+    "裡": "里",
+    "裏": "里",
+    "兩": "两",
+    "獵": "猎",
+    "臨": "临",
+    "羅": "罗",
+    "瑪": "玛",
+    "貿": "贸",
+    "門": "门",
+    "腦": "脑",
+    "擬": "拟",
+    "盤": "盘",
+    "權": "权",
+    "讓": "让",
+    "認": "认",
+    "設": "设",
+    "審": "审",
+    "時": "时",
+    "實": "实",
+    "識": "识",
+    "適": "适",
+    "數": "数",
+    "雙": "双",
+    "說": "说",
+    "題": "题",
+    "體": "体",
+    "條": "条",
+    "聽": "听",
+    "統": "统",
+    "圖": "图",
+    "靈": "灵",
+    "團": "团",
+    "萬": "万",
+    "為": "为",
+    "維": "维",
+    "偽": "伪",
+    "穩": "稳",
+    "務": "务",
+    "習": "习",
+    "險": "险",
+    "項": "项",
+    "曉": "晓",
+    "選": "选",
+    "學": "学",
+    "壓": "压",
+    "亞": "亚",
+    "嚴": "严",
+    "驗": "验",
+    "頁": "页",
+    "應": "应",
+    "營": "营",
+    "擁": "拥",
+    "優": "优",
+    "與": "与",
+    "語": "语",
+    "預": "预",
+    "雲": "云",
+    "戰": "战",
+    "張": "张",
+    "爭": "争",
+    "證": "证",
+    "質": "质",
+    "製": "制",
+    "種": "种",
+}
+
+
+def _simplified(query: str) -> str:
+    return "".join(_TRADITIONAL_TO_SIMPLIFIED.get(char, char) for char in query)
+
+
+def _query_variants(query: str) -> list[str]:
+    """Query plus a simplified-Chinese variant for traditional input."""
+    variants = [query]
+    simplified = _simplified(query)
+    if simplified != query:
+        variants.append(simplified)
+    return variants
+
+
 # ZIM Language metadata uses ISO 639-2/T codes (e.g. "eng", "zho"); accept the
 # common two-letter ISO 639-1 alias when filtering cross-archive searches.
 _LANGUAGE_ALIASES = {
@@ -988,14 +1163,17 @@ _SEE_ALSO_LABELS = {
 
 def _find_links(
     archive: Archive, soup: BeautifulSoup, article_path: str, archive_id: str
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Extract internal article links: curated See-also section first, then body links.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract internal article links.
 
-    Returns (see_also, links); each item is {article_path, title} with
-    article_path verified to exist and directly usable with read_article.
+    Returns (see_also, links, notes). notes come from hatnotes ("X
+    redirects here", "主条目：…") and surface disambiguation targets.
+    Each item is {article_path, title[, label]} with article_path verified
+    to exist and directly usable with read_article.
     """
     see_also: list[dict[str, Any]] = []
     body: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
     seen: set[str] = set()
     root, mediawiki = _content_root(soup)
 
@@ -1028,6 +1206,31 @@ def _find_links(
             }
         )
 
+    for hatnote in root.select(_HATNOTE_SELECTOR):
+        if len(notes) >= 5:
+            break
+        note_links: list[dict[str, Any]] = []
+        for anchor in hatnote.find_all("a", href=True):
+            try:
+                path = _resolve_image_path(article_path, str(anchor["href"]))
+            except (KeyError, ValueError):
+                continue
+            try:
+                if not archive.has_entry_by_path(path):
+                    continue
+            except RuntimeError:
+                continue
+            note_links.append(
+                {
+                    "article_path": path,
+                    "uri": _article_uri(archive_id, path),
+                    "title": anchor.get_text(" ", strip=True),
+                }
+            )
+        label = _compact_text(hatnote, 300)
+        if note_links:
+            notes.append({"label": label, "links": note_links})
+
     for h2 in root.find_all("h2"):
         label = (h2.get("id") or "").replace("_", " ").strip().lower()
         if not label:
@@ -1046,7 +1249,7 @@ def _find_links(
                 break
             add(anchor, body, MAX_BODY_LINKS)
 
-    return see_also, body
+    return see_also, body, notes
 
 
 def _find_images_in_article(
@@ -1062,7 +1265,14 @@ def _find_images_in_article(
 
 
 def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]:
+    """Article images with duplicate paths and tiny icons removed.
+
+    ZIM convention puts the main article image first; repeated references
+    to the same image (flags, padlock icons in citations) add no recall
+    value, so only the first occurrence is kept.
+    """
     images: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if not src:
@@ -1071,10 +1281,21 @@ def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]
             image_path = _resolve_image_path(article_path, str(src))
         except ValueError:
             continue
-        figure = img.find_parent("figure")
-        caption = figure.find("figcaption") if figure else None
+        if image_path in seen:
+            continue
         width, height = img.get("width"), img.get("height")
         width_value = int(width) if str(width).isdigit() else None
+        height_value = int(height) if str(height).isdigit() else None
+        if (
+            width_value is not None
+            and height_value is not None
+            and max(width_value, height_value) < 50
+        ):
+            # Padlock/flag/wiki-logo chrome, not article imagery.
+            continue
+        seen.add(image_path)
+        figure = img.find_parent("figure")
+        caption = figure.find("figcaption") if figure else None
         images.append(
             {
                 "index": len(images),
@@ -1084,7 +1305,8 @@ def _find_images(soup: BeautifulSoup, article_path: str) -> list[dict[str, Any]]
                 "alt": str(img.get("alt", "")),
                 "caption": caption.get_text(" ", strip=True) if caption else "",
                 "width": width_value,
-                "height": int(height) if str(height).isdigit() else None,
+                "height": height_value,
+                "primary": not images,
             }
         )
     return images
@@ -1307,6 +1529,7 @@ _TOOL_DEFINITIONS = [
                                 "type": "string",
                                 "enum": ["exact_title", "fulltext", "title"],
                             },
+                            "matched_query": {"type": "string"},
                         },
                     },
                 },
@@ -1455,6 +1678,7 @@ _TOOL_DEFINITIONS = [
                             "caption": {"type": "string"},
                             "width": {"type": ["integer", "null"]},
                             "height": {"type": ["integer", "null"]},
+                            "primary": {"type": "boolean"},
                         },
                     },
                 },
@@ -1477,6 +1701,26 @@ _TOOL_DEFINITIONS = [
                             "article_path": {"type": "string"},
                             "uri": {"type": "string"},
                             "title": {"type": "string"},
+                        },
+                    },
+                },
+                "notes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "links": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "article_path": {"type": "string"},
+                                        "uri": {"type": "string"},
+                                        "title": {"type": "string"},
+                                    },
+                                },
+                            },
                         },
                     },
                 },
