@@ -1063,9 +1063,8 @@ def list_references(
 MAX_SEE_ALSO_LINKS = 10
 MAX_BODY_LINKS = 15
 
-# ponytail: ~150 common Traditional->Simplified pairs, not full OpenCC.
-# Covers high-frequency title/query characters; extend the map if misses
-# appear in real use. Dependency-free by design.
+# OpenCC TSCharacters one-to-one mappings; multi-output entries are omitted.
+# Embedded to keep offline query expansion deterministic and dependency-free.
 _TRADITIONAL_TO_SIMPLIFIED = {
     "㑯": "㑔",
     "㑳": "㑇",
