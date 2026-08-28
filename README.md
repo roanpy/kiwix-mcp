@@ -47,8 +47,8 @@ Tools:
   URLs, or select a visible marker such as `1`, `a`, or `note 1` via
   `citation_label`.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
-  fallback for clients such as pi. Prefer the entry with `primary=True` from
-  `read_article`, or pass its `image_path` when another image is wanted.
+  fallback for clients such as pi. Prefer the entry with `primary=True` unless
+  another image is wanted, then pass the chosen entry's `image_path`.
   Temporary images are deduplicated and capped at the 16 most recently used files.
 
 MCP resources (2.x):
