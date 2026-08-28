@@ -40,14 +40,15 @@ Tools:
   and reference count without returning the full article.
 - `read_article`: clean, bounded text with `next_offset` continuation, optional
   `section` selection by title or anchor, capped image
-  metadata, image metadata pagination via `image_offset`, and concise related links
-  (each link/see-also entry carries a `uri` field).
+  metadata (`primary` marks the first image kept after duplicate-path removal
+  and tiny-icon filtering), image metadata pagination via `image_offset`, and
+  concise related links (each link/see-also entry carries a `uri` field).
 - `list_references`: page through MediaWiki citations, notes, and preserved external
   URLs, or select a visible marker such as `1`, `a`, or `note 1` via
   `citation_label`.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
-  fallback for clients such as pi. Pass `image_path` from `read_article` when
-  index 0 is not the desired image.
+  fallback for clients such as pi. Prefer the entry with `primary=True` from
+  `read_article`, or pass its `image_path` when another image is wanted.
   Temporary images are deduplicated and capped at the 16 most recently used files.
 
 MCP resources (2.x):
