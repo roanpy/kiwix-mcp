@@ -13,6 +13,13 @@ from mcp.types import ImageContent, TextContent
 import server
 
 
+def _search_archive(**attributes):
+    return SimpleNamespace(
+        get_entry_by_path=lambda path: SimpleNamespace(path=path, is_redirect=False),
+        **attributes,
+    )
+
+
 def test_empty_archive_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -469,7 +476,7 @@ def test_article_uri_round_trip_special_chars() -> None:
 def test_search_fulltext_mode_returns_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = SimpleNamespace(
+    archive = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
     )
@@ -503,7 +510,7 @@ def test_search_fulltext_mode_returns_results(
 def test_search_title_mode_forces_suggestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = SimpleNamespace(
+    archive = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
     )
@@ -534,13 +541,13 @@ def test_search_title_mode_forces_suggestion(
 def test_search_cross_archive_with_fulltext_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = SimpleNamespace(
+    first = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         name="first",
         get_metadata=lambda key: b"en" if key == "Language" else b"",
     )
-    second = SimpleNamespace(
+    second = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         name="second",
@@ -587,13 +594,13 @@ def test_search_cross_archive_with_fulltext_mode(
 def test_search_cross_archive_filters_by_language(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = SimpleNamespace(
+    first = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         name="first",
         get_metadata=lambda key: b"eng" if key == "Language" else b"",
     )
-    second = SimpleNamespace(
+    second = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         name="second",
@@ -643,7 +650,7 @@ def test_search_cross_archive_filters_by_language(
 def test_search_language_filter_strips_metadata_whitespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = SimpleNamespace(
+    archive = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         get_metadata=lambda key: b"eng, zho" if key == "Language" else b"",
@@ -674,7 +681,7 @@ def test_search_language_filter_strips_metadata_whitespace(
 def test_search_single_archive_ignores_language_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = SimpleNamespace(
+    archive = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         get_metadata=lambda key: b"en" if key == "Language" else b"",
@@ -705,7 +712,7 @@ def test_search_single_archive_ignores_language_filter(
 def test_search_pagination_keeps_exact_title_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = SimpleNamespace(
+    archive = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: True,
         get_entry_by_title=lambda query: SimpleNamespace(path="exact"),
@@ -754,12 +761,12 @@ def test_search_pagination_keeps_exact_title_first(
 def test_search_can_aggregate_all_archives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = SimpleNamespace(
+    first = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         name="first",
     )
-    second = SimpleNamespace(
+    second = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: False,
         name="second",
@@ -1176,15 +1183,24 @@ def test_find_images_dedupes_and_drops_tiny_icons() -> None:
 def test_search_traditional_query_matches_simplified_title(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = SimpleNamespace(
+    archive = _search_archive(
         has_fulltext_index=True,
         has_entry_by_title=lambda query: query == "图灵机",
         get_entry_by_title=lambda query: SimpleNamespace(path="A/图灵机"),
     )
-    search_result = SimpleNamespace(
-        getResults=lambda start, limit: ["A/图灵机"],
-        getEstimatedMatches=lambda: 1,
+    search_results = iter(
+        [
+            SimpleNamespace(
+                getResults=lambda start, limit: [],
+                getEstimatedMatches=lambda: 0,
+            ),
+            SimpleNamespace(
+                getResults=lambda start, limit: ["A/图灵机", "A/related"],
+                getEstimatedMatches=lambda: 2,
+            ),
+        ]
     )
+    summary_queries = []
     monkeypatch.setattr(
         server, "_select_paths", lambda archive_id: [("zh_all.zim", Path("zh_all.zim"))]
     )
@@ -1192,18 +1208,22 @@ def test_search_traditional_query_matches_simplified_title(
     monkeypatch.setattr(
         server,
         "Searcher",
-        lambda archive: SimpleNamespace(search=lambda query: search_result),
+        lambda archive: SimpleNamespace(search=lambda query: next(search_results)),
     )
     monkeypatch.setattr(
         server,
         "_article_summary",
-        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+        lambda archive, archive_id, article_path, query: (
+            summary_queries.append(query) or {"article_path": article_path}
+        ),
     )
 
     result = server.search("圖靈機", "zh_all.zim")
 
     assert result["results"][0]["match_type"] == "exact_title"
     assert result["results"][0]["matched_query"] == "图灵机"
+    assert result["estimated_matches"] == 2
+    assert summary_queries == ["", "图灵机"]
 
 
 def test_query_variants_only_differ_for_traditional() -> None:
@@ -1220,6 +1240,10 @@ def test_reverse_map_drops_ambiguous_simplified_chars() -> None:
     reverse = server._simplified_to_traditional()
     # 發 and 髮 both map to 发, so 发 must not reverse-map at all
     assert "发" not in reverse
+    # Three-or-more-way collisions must stay excluded after later entries.
+    assert "台" not in reverse
+    assert server._query_variants("台湾") == ["台湾", "台灣"]
+    assert server._query_variants("后台") == ["后台", "後台"]
     assert reverse.get("国") == "國"
 
 
@@ -1228,13 +1252,22 @@ def test_cross_archive_exact_title_outranks_fulltext_noise(
 ) -> None:
     """Cross-archive search: exact_title from any archive must rank above
     fulltext hits from other archives, regardless of archive order."""
-    wiki_archive = SimpleNamespace(
+    canonical = SimpleNamespace(path="Fainting_goat", is_redirect=False)
+    alias = SimpleNamespace(
+        path="Fainting_Goat",
+        is_redirect=True,
+        get_redirect_entry=lambda: canonical,
+    )
+    wiki_archive = _search_archive(
         has_fulltext_index=True,
         has_title_index=True,
         has_entry_by_title=lambda query: query == "Fainting goat",
         get_entry_by_title=lambda query: SimpleNamespace(path="A/Fainting_goat"),
     )
-    wikibooks_archive = SimpleNamespace(
+    wiki_archive.get_entry_by_path = lambda path: (
+        alias if path == alias.path else canonical
+    )
+    wikibooks_archive = _search_archive(
         has_fulltext_index=True,
         has_title_index=False,
         has_entry_by_title=lambda query: False,
@@ -1246,13 +1279,17 @@ def test_cross_archive_exact_title_outranks_fulltext_noise(
             ("wikipedia_en_all_nopic_2026-06.zim", Path("wikipedia.zim")),
         ]
 
-    fulltext_result = SimpleNamespace(
+    noise_result = SimpleNamespace(
         getResults=lambda start, limit: [
             "Goats/Breeds",
             "Goats/Printable_version",
             "Goats/Introduction",
         ],
         getEstimatedMatches=lambda: 3,
+    )
+    wiki_result = SimpleNamespace(
+        getResults=lambda start, limit: [canonical.path],
+        getEstimatedMatches=lambda: 1,
     )
     suggest_result = SimpleNamespace(
         getResults=lambda start, limit: ["Fainting_Goat", "Fainting_goat_syndrome"],
@@ -1268,7 +1305,11 @@ def test_cross_archive_exact_title_outranks_fulltext_noise(
     monkeypatch.setattr(
         server,
         "Searcher",
-        lambda archive: SimpleNamespace(search=lambda query: fulltext_result),
+        lambda archive: SimpleNamespace(
+            search=lambda query: (
+                wiki_result if archive is wiki_archive else noise_result
+            )
+        ),
     )
     monkeypatch.setattr(
         server,
@@ -1285,7 +1326,10 @@ def test_cross_archive_exact_title_outranks_fulltext_noise(
 
     assert result["results"][0]["match_type"] == "exact_title"
     assert result["results"][0]["search_mode"] == "title"
-    assert result["results"][0]["article_path"] == "Fainting_Goat"
+    assert result["results"][0]["article_path"] == canonical.path
+    assert [item["article_path"] for item in result["results"]].count(
+        canonical.path
+    ) == 1
 
 
 def test_stdio_idle_timeout_exits_real_process(tmp_path: Path) -> None:

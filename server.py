@@ -271,7 +271,7 @@ def _main_entry_path(archive: Archive) -> str | None:
 def _archive_metadata(archive: Archive, key: str) -> str | None:
     try:
         return bytes(archive.get_metadata(key)).decode("utf-8", errors="replace")
-    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         return None
 
 
@@ -674,11 +674,9 @@ def list_archives() -> dict[str, Any]:
                 "Tags",
                 "Flavour",
             ):
-                try:
-                    value = archive.get_metadata(key)
-                    item[key.lower()] = bytes(value).decode("utf-8", errors="replace")
-                except (KeyError, RuntimeError):
-                    pass
+                value = _archive_metadata(archive, key)
+                if value is not None:
+                    item[key.lower()] = value
         except (OSError, RuntimeError, ValueError) as exc:
             item["error"] = str(exc)
         archives.append(item)
@@ -723,22 +721,16 @@ def search(
         if not cross_archive:
             return True
         if language:
-            try:
-                value = bytes(archive.get_metadata("Language")).decode(
-                    "utf-8", errors="replace"
-                )
-            except (KeyError, RuntimeError, ValueError):
+            value = _archive_metadata(archive, "Language")
+            if value is None:
                 return False
             languages = {token.strip() for token in value.lower().split(",")}
             alias = _LANGUAGE_ALIASES.get(language, "")
             if not any(token in languages for token in (language, alias) if token):
                 return False
         if flavour:
-            try:
-                value = bytes(archive.get_metadata("Flavour")).decode(
-                    "utf-8", errors="replace"
-                )
-            except (KeyError, RuntimeError, ValueError):
+            value = _archive_metadata(archive, "Flavour")
+            if value is None:
                 return False
             if flavour != value.lower().strip():
                 return False
@@ -757,6 +749,7 @@ def search(
             archive = _archive(path)
             if not _archive_matches(archive):
                 continue
+            archive_estimates: list[int] = []
             for variant in query_variants:
                 if mode == "fulltext":
                     if not archive.has_fulltext_index:
@@ -792,9 +785,8 @@ def search(
                         else None
                     )
                 estimate = search_result.getEstimatedMatches()
-                if estimate is not None and variant == query:
-                    estimated_matches += int(estimate)
-                    estimated_known = True
+                if estimate is not None:
+                    archive_estimates.append(int(estimate))
                 found = search_result.getResults(0, offset + limit + 1)
                 if exact_path:
                     exact_path = str(exact_path)
@@ -814,6 +806,9 @@ def search(
                     other_matches.append(
                         (archive, name, article_path, search_mode, variant)
                     )
+            if archive_estimates:
+                estimated_matches += max(archive_estimates)
+                estimated_known = True
         except (OSError, RuntimeError, ValueError) as exc:
             if mode == "fulltext":
                 raise
@@ -822,11 +817,34 @@ def search(
     # Cross-archive: exact_title must outrank fulltext noise from other
     # archives, not just within its own archive's batch.
     matches.sort(key=lambda m: 0 if m[3] == "exact_title" else 1)
+    canonical_matches: list[tuple[Archive, str, str, str, str]] = []
+    canonical_seen: set[tuple[str, str]] = set()
+    for archive, name, article_path, match_type, matched_query in matches:
+        try:
+            canonical_path = str(_entry(archive, article_path).path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append({"archive_id": name, "error": str(exc)})
+            continue
+        key = (name, canonical_path)
+        if key in canonical_seen:
+            continue
+        canonical_seen.add(key)
+        canonical_matches.append(
+            (archive, name, canonical_path, match_type, matched_query)
+        )
+        if len(canonical_matches) >= offset + limit + 1:
+            break
+    matches = canonical_matches
     page_matches = matches[offset : offset + limit]
     results: list[dict[str, Any]] = []
     for archive, name, article_path, match_type, matched_query in page_matches:
         try:
-            item = _article_summary(archive, name, article_path, query)
+            item = _article_summary(
+                archive,
+                name,
+                article_path,
+                "" if match_type == "exact_title" else matched_query,
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append({"archive_id": name, "error": str(exc)})
             continue
@@ -4008,12 +4026,16 @@ def _simplified(query: str) -> str:
 def _simplified_to_traditional() -> dict[str, str]:
     """Reverse map for simplified input; only defined where unambiguous."""
     reverse: dict[str, str] = {}
+    ambiguous: set[str] = set()
     for trad, simp in _TRADITIONAL_TO_SIMPLIFIED.items():
+        if simp in ambiguous:
+            continue
         if simp not in reverse:
             reverse[simp] = trad
         else:
             # ambiguous reverse (e.g. 发→發/髮): don't guess
             reverse.pop(simp, None)
+            ambiguous.add(simp)
     return reverse
 
 
