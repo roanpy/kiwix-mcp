@@ -216,6 +216,29 @@ def test_read_article_is_not_truncated_when_query_window_contains_all_text(
     assert result["text"] == text[567:]
 
 
+def test_read_article_accepts_limit_compatibility_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = SimpleNamespace(
+        size=2000, mimetype="text/plain", content=("x" * 2000).encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    result = server.read_article(
+        "test.zim", "article", limit=1000, include_images=False, include_links=False
+    )
+
+    assert len(result["text"]) == 1000
+    assert result["next_offset"] == 1000
+
+
 def test_archive_selection_rejects_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -252,7 +275,8 @@ def test_mcp_tool_registry_is_stable() -> None:
     )
     assert "mode" in tools["search"].input_schema["properties"]
     assert "archive_id from list_archives" in tools["search"].description
-    assert "no limit parameter" in tools["read_article"].description
+    assert "compatibility alias" in tools["read_article"].description
+    assert "limit" in tools["read_article"].input_schema["properties"]
     assert "outline" in tools["inspect_article"].output_schema["properties"]
     assert "section" in tools["read_article"].input_schema["properties"]
     assert "offset" in tools["read_article"].input_schema["properties"]

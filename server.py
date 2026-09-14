@@ -129,7 +129,8 @@ MCP_INSTRUCTIONS = (
     "archives for coverage and maxi archives "
     "when images matter; use title, date, and description to break ties. "
     "For long Wikipedia articles, call inspect_article first, then read_article with "
-    "a returned section anchor; read_article uses max_chars and offset, never limit. "
+    "a returned section anchor; read_article uses max_chars and offset (limit is "
+    "accepted only as a compatibility alias for max_chars). "
     "Use list_references when a claim needs provenance. "
     "For images, inspect read_article metadata and prefer the image with "
     "primary=True; use its image_path with extract_image instead of index 0. "
@@ -892,6 +893,7 @@ def read_article(
     include_links: bool = True,
     image_offset: int = 0,
     section: str = "",
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """Read article text. include_images/include_links 时附带图片列表和条目链接。"""
     selected = _select_paths(archive_id)
@@ -905,6 +907,8 @@ def read_article(
         raise ValueError(f"Article is too large to read safely: {item.size} bytes")
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
         raise ValueError(f"Article is not text: {item.mimetype}")
+    if limit is not None and max_chars == 12000:
+        max_chars = limit
     max_chars = min(max(int(max_chars), 1000), 50000)
     offset = max(int(offset), 0)
     content = bytes(item.content)
@@ -4572,7 +4576,7 @@ _TOOL_DEFINITIONS = [
     Tool(
         name="read_article",
         title="Read a ZIM article",
-        description="Read one article. Required: archive_id and article_path from a search result. Use max_chars for text size and offset for continuation; this tool has no limit parameter.",
+        description="Read one article. Required: archive_id and article_path from a search result. Use max_chars for text size and offset for continuation; limit is accepted only as a compatibility alias for max_chars.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -4593,6 +4597,12 @@ _TOOL_DEFINITIONS = [
                     "minimum": 1000,
                     "maximum": 50000,
                     "description": "Maximum characters returned in this window; use this instead of limit.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 50000,
+                    "description": "Compatibility alias for max_chars; prefer max_chars.",
                 },
                 "offset": {
                     "type": "integer",
