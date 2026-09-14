@@ -515,8 +515,71 @@ def test_unknown_archive_error_lists_available_archives(
     assert "alpha.zim" in message and "beta.zim" in message
 
 
-def test_missing_article_path_errors_are_actionable() -> None:
-    archive = SimpleNamespace()
+def test_article_path_falls_back_to_title() -> None:
+    """Agents pass "Machine learning"; the ZIM path is "Machine_learning"."""
+    canonical = SimpleNamespace(path="Machine_learning", is_redirect=False)
+    archive = SimpleNamespace(
+        get_entry_by_path=lambda path: (_ for _ in ()).throw(
+            KeyError("Cannot find entry")
+        ),
+        has_entry_by_title=lambda title: title == "Machine learning",
+        get_entry_by_title=lambda title: canonical,
+    )
+    assert server._entry(archive, "Machine learning") is canonical
+
+
+def _never_found_archive():
+    return SimpleNamespace(
+        get_entry_by_path=lambda path: (_ for _ in ()).throw(
+            KeyError("Cannot find entry")
+        ),
+        has_entry_by_title=lambda title: False,
+    )
+
+
+def test_article_not_found_message_guides_and_suggests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(
+            suggest=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: ["World_War_2"]
+            )
+        ),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        server._entry(_never_found_archive(), "world war 2")
+
+    message = str(excinfo.value)
+    assert "not the article title" in message
+    assert "must not be URL-encoded" in message
+    assert "Closest match: 'World_War_2'" in message
+
+
+def test_article_not_found_message_without_suggestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(
+            suggest=lambda query: SimpleNamespace(getResults=lambda start, limit: [])
+        ),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        server._entry(_never_found_archive(), "nonsense")
+    assert "Closest match" not in str(excinfo.value)
+
+
+def test_missing_article_path_errors_are_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_entry_by_title=lambda title: False,
+        has_entry_by_path=lambda path: False,
+    )
 
     with pytest.raises(ValueError, match="article_path is required"):
         server._entry(archive, "")
@@ -527,6 +590,13 @@ def test_missing_article_path_errors_are_actionable() -> None:
         raise KeyError("Cannot find entry")
 
     archive.get_entry_by_path = missing
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(
+            suggest=lambda q: SimpleNamespace(getResults=lambda a, b: [])
+        ),
+    )
     with pytest.raises(ValueError, match="Article not found"):
         server._entry(archive, "Nope")
 

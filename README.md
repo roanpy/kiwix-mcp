@@ -196,6 +196,12 @@ argument returns the valid and required names for that tool, an unknown archive
 returns the available `archive_id` values, and a missing article points back to
 `search` and `list_archives`.
 
+`article_path` is an opaque ZIM path rather than the article title: it uses
+underscores where the title has spaces. Passing the readable title still works,
+because the server falls back to a title lookup, but building a path by hand or
+URL-encoding a title does not. When a path cannot be resolved, the error names a
+close match from the archive's suggestion index when one exists.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

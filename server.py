@@ -143,8 +143,11 @@ MCP_INSTRUCTIONS = (
     "Search and read local ZIM archives. Always call list_archives first, then pass "
     "one returned archive_id exactly in every search, inspect_article, read_article, "
     "list_references, and extract_image call; use archive_id='*' only for search "
-    "across archives. Choose the archive by language and collection: prefer full "
-    "archives for coverage and maxi archives "
+    "across archives. "
+    "Copy article_path verbatim from search results: it is a ZIM path, not the "
+    "article title, and must never be URL-encoded or built by hand. "
+    "Choose the archive by language and collection: prefer full archives for "
+    "coverage and maxi archives "
     "when images matter; use title, date, and description to break ties. "
     "For long Wikipedia articles, call inspect_article first, then read_article with "
     "a returned section anchor; read_article uses max_chars and offset (limit is "
@@ -281,11 +284,38 @@ def _raw_entry(archive: Archive, article_path: str):
         )
     try:
         return archive.get_entry_by_path(article_path)
-    except KeyError as exc:
-        raise ValueError(
-            f"Article not found: {article_path!r}. Use an article_path from "
-            f"search results in this archive."
-        ) from exc
+    except KeyError:
+        pass
+    # Agents commonly pass the human-readable title (spaces) where the ZIM
+    # stores a path (underscores), so resolve by title before giving up.
+    title = str(article_path).replace("_", " ").strip()
+    try:
+        if title and archive.has_entry_by_title(title):
+            return archive.get_entry_by_title(title)
+    except (OSError, RuntimeError):
+        pass
+    raise ValueError(_article_not_found_message(archive, article_path))
+
+
+def _article_not_found_message(archive: Archive, article_path: str) -> str:
+    """Explain the miss and, when possible, name a close match."""
+    hint = ""
+    try:
+        candidates = [
+            str(path)
+            for path in SuggestionSearcher(archive)
+            .suggest(str(article_path))
+            .getResults(0, 1)
+        ]
+    except (OSError, RuntimeError, ValueError):
+        candidates = []
+    if candidates:
+        hint = f" Closest match: {candidates[0]!r}."
+    return (
+        f"Article not found: {article_path!r}. Pass an article_path copied exactly "
+        f"from a search result in this archive; it is not the article title and "
+        f"must not be URL-encoded.{hint}"
+    )
 
 
 def _too_large(size: int) -> None:
@@ -4692,7 +4722,7 @@ _TOOL_DEFINITIONS = [
                 },
                 "article_path": {
                     "type": "string",
-                    "description": "Required article_path from the search result.",
+                    "description": "Required. Copy article_path exactly from a search result; it is not the article title and must not be URL-encoded.",
                 },
                 "query": {
                     "type": "string",
