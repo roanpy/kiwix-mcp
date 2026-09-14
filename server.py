@@ -1143,8 +1143,12 @@ def list_references(
     labels = _reference_labels(soup)
     references = [_reference_item(node, labels) for node in _reference_nodes(soup)]
     total_references = len(references)
+    # Surface real labels when a filter misses, so the caller can retry instead
+    # of guessing what a citation_label looks like in this article.
+    available_labels: list[str] = []
     if citation_label is not None:
         requested_label = " ".join(str(citation_label).split()).casefold()
+        unfiltered = references
         references = [
             reference
             for reference in references
@@ -1152,6 +1156,12 @@ def list_references(
             and " ".join(reference["citation_label"].split()).casefold()
             == requested_label
         ]
+        if not references:
+            available_labels = [
+                str(reference["citation_label"])
+                for reference in unfiltered
+                if reference["citation_label"] is not None
+            ][:10]
     matched_references = len(references)
     offset = min(max(int(offset), 0), len(references))
     limit = min(max(int(limit), 1), 50)
@@ -1165,6 +1175,7 @@ def list_references(
         "next_offset": next_offset,
         "total_references": total_references,
         "matched_references": matched_references,
+        "available_citation_labels": available_labels,
         "citation_label": citation_label,
         "references": page,
         "uri": _article_uri(name, entry.path),
@@ -4848,6 +4859,11 @@ _TOOL_DEFINITIONS = [
                 "next_offset": {"type": ["integer", "null"]},
                 "total_references": {"type": "integer"},
                 "matched_references": {"type": "integer"},
+                "available_citation_labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Real labels to retry with when citation_label matched nothing.",
+                },
                 "citation_label": {"type": ["string", "null"]},
                 "references": {
                     "type": "array",
@@ -4886,6 +4902,7 @@ _TOOL_DEFINITIONS = [
                 "offset",
                 "total_references",
                 "matched_references",
+                "available_citation_labels",
                 "citation_label",
                 "references",
                 "uri",
@@ -4943,7 +4960,13 @@ def _coerce_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     coerced = dict(arguments)
     for key, value in arguments.items():
         expected = types.get(key)
-        if expected == "integer" and not isinstance(value, bool):
+        if expected == "integer":
+            if isinstance(value, bool):
+                # bool is an int subclass; True would silently become 1.
+                raise ValueError(
+                    f"Invalid argument for {name}: {key} must be an integer, "
+                    f"got {value!r}."
+                )
             if isinstance(value, int):
                 continue
             try:

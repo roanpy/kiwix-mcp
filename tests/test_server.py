@@ -405,6 +405,54 @@ def test_dispatch_coerces_string_scalars() -> None:
         server._coerce_arguments("read_article", {"include_links": "maybe"})
 
 
+def test_dispatch_rejects_booleans_for_integer_arguments() -> None:
+    """bool is an int subclass; True must not silently become 1."""
+    for tool, arguments in [
+        ("search", {"limit": True}),
+        ("extract_image", {"image_index": True}),
+        ("read_article", {"offset": False}),
+    ]:
+        with pytest.raises(ValueError, match="must be an integer"):
+            server._coerce_arguments(tool, arguments)
+
+
+def test_reference_label_miss_lists_available_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = (
+        '<html><body><main><div class="mw-parser-output">'
+        '<p>Claim<sup class="reference"><a href="#cite_note-a">'
+        '<span class="mw-reflink-text">[1]</span></a></sup></p>'
+        '<div class="mw-references-wrap"><ol class="references">'
+        '<li id="cite_note-a"><span class="mw-cite-backlink">^</span>A</li>'
+        "</ol></div></div></main></body></html>"
+    )
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html.encode(), title="T"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="T", title="T", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    miss = server.list_references("test.zim", "T", citation_label="999")
+    assert miss["status"] == "no_hits"
+    assert miss["matched_references"] == 0
+    assert miss["available_citation_labels"] == ["1"]
+
+    hit = server.list_references("test.zim", "T", citation_label="1")
+    assert hit["status"] == "ok"
+    assert hit["matched_references"] == 1
+    assert hit["available_citation_labels"] == []
+
+    unfiltered = server.list_references("test.zim", "T")
+    assert unfiltered["available_citation_labels"] == []
+
+
 def test_unknown_tool_lists_available_tools() -> None:
     with pytest.raises(ValueError) as excinfo:
         server._dispatch_tool("list_zims", {})
