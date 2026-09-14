@@ -135,6 +135,9 @@ MCP_INSTRUCTIONS = (
     "For images, inspect read_article metadata and prefer the image with "
     "primary=True; use its image_path with extract_image instead of index 0. "
     "For cross-archive comparison, call search with archive_id='*'. "
+    "To follow a topic across articles, reuse read_article links/see_also "
+    "article_path values (and uri fragments) for the next hop instead of "
+    "searching again. "
     "Ask only when the user's goal leaves the choice ambiguous. "
     "For bilingual Wikipedia research, translate the search query into each archive's "
     "language and search the archives separately; do not assume article paths match. "
@@ -4114,8 +4117,10 @@ def _find_links(
 
     Returns (see_also, links, notes). notes come from hatnotes ("X
     redirects here", "主条目：…") and surface disambiguation targets.
-    Each item is {article_path, title[, label]} with article_path verified
-    to exist and directly usable with read_article.
+    see_also is the curated set; links is the broader lead/body set. Both are
+    returned so link-following traversal keeps its full fan-out, and no path
+    appears twice. Each item is {article_path, uri, title} with article_path
+    verified to exist and directly usable with read_article.
     """
     see_also: list[dict[str, Any]] = []
     body: list[dict[str, Any]] = []
@@ -4189,11 +4194,10 @@ def _find_links(
                     add(tag, see_also, MAX_SEE_ALSO_LINKS)
             break
 
-    if not see_also:
-        for anchor in root.find_all("a", href=True):
-            if len(body) >= MAX_BODY_LINKS:
-                break
-            add(anchor, body, MAX_BODY_LINKS)
+    for anchor in root.find_all("a", href=True):
+        if len(body) >= MAX_BODY_LINKS:
+            break
+        add(anchor, body, MAX_BODY_LINKS)
 
     return see_also, body, notes
 

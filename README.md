@@ -50,7 +50,10 @@ Tools:
   `section` selection by title or anchor, capped image
   metadata (`primary` marks the first image kept after duplicate-path removal
   and tiny-icon filtering), image metadata pagination via `image_offset`, and
-  concise related links (each link/see-also entry carries a `uri` field).
+  related links. `see_also` is the curated "See also" set; `links` is the broader
+  lead/body set, returned even when a See also section exists so link-following
+  traversal keeps its fan-out. A path never appears in both lists, and every
+  entry carries `article_path`, `title` and a `uri`.
 - `list_references`: page through MediaWiki citations, notes, and preserved external
   URLs, or select a visible marker such as `1`, `a`, or `note 1` via
   `citation_label`.
@@ -83,6 +86,14 @@ For long Wikipedia articles, call `inspect_article` first and pass a returned
 outline `anchor` as `read_article.section`.
 When it returns `next_image_offset`, call it again with the same article and
 that `image_offset` to continue a long image list.
+
+Multi-hop exploration: every `links`, `see_also` and outline entry is a verified
+path in the same archive, so an agent can chain hops (for example
+`search` → `read_article` → follow `links[].article_path` → `read_article`)
+without re-searching. Hop within an article by passing an outline `anchor` as
+`section`, or use the entry's `uri` as an MCP resource. Links stay inside one
+archive; to hop between archives, run `search` again with another `archive_id`.
+There is no backlink ("what links here") lookup.
 
 Diagnostics are off by default. Set `KIWIX_MCP_LOG_LEVEL=INFO` for stderr logs,
 or set `KIWIX_MCP_LOG_FILE=/path/to/kiwix.log` for a small rotating log (up to

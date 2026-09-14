@@ -434,11 +434,12 @@ def test_image_metadata_uses_caption_and_dimensions() -> None:
     }
 
 
-def test_links_prefer_see_also_and_fallback_to_body() -> None:
+def test_links_return_see_also_and_body_without_duplicates() -> None:
     archive = SimpleNamespace(has_entry_by_path=lambda path: True)
     soup = server.BeautifulSoup(
         '<p><a href="body">Body</a></p><h2 id="See_also">See also</h2>'
-        '<ul><li><a href="related">Related</a></li></ul><h2>References</h2>',
+        '<ul><li><a href="related">Related</a></li></ul>'
+        '<h2>References</h2><p><a href="body">Body again</a></p>',
         "html.parser",
     )
     see_also, links, notes = server._find_links(archive, soup, "article", "en_all.zim")
@@ -449,7 +450,14 @@ def test_links_prefer_see_also_and_fallback_to_body() -> None:
             "uri": "kiwix://en_all.zim/related",
         }
     ]
-    assert links == []
+    # Body links stay available for link-following traversal even when a
+    # curated See also section exists.
+    assert links == [
+        {"article_path": "body", "title": "Body", "uri": "kiwix://en_all.zim/body"}
+    ]
+    assert not {item["article_path"] for item in see_also} & {
+        item["article_path"] for item in links
+    }
     assert notes == []
 
     see_also, links, notes = server._find_links(
