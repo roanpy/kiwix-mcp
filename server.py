@@ -13,6 +13,7 @@ import posixpath
 import sys
 import tempfile
 from functools import lru_cache
+from itertools import chain
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -714,6 +715,7 @@ def search(
     cross_archive = archive_id.strip() == "*"
     limit = min(max(int(limit), 1), 20)
     offset = min(max(int(offset), 0), 1000)
+    limit = min(limit, 1001 - offset)
     selected = _select_paths("") if cross_archive else _select_paths(archive_id)
 
     def _archive_matches(archive: Archive) -> bool:
@@ -737,13 +739,31 @@ def search(
         return True
 
     exact_matches: list[tuple[Archive, str, str, str, str]] = []
-    other_matches: list[tuple[Archive, str, str, str, str]] = []
+    result_streams = []
     errors: list[dict[str, str]] = []
     estimated_matches = 0
     estimated_known = False
     query_variants = _query_variants(query)
     exact_seen: set[tuple[str, str]] = set()
-    other_seen: set[tuple[str, str]] = set()
+
+    def _matches(archive, name, search_result, search_mode, variant):
+        # Read past redirect aliases; a raw candidate count is not a page size.
+        start = 0
+        batch_size = max(32, offset + limit + 1)
+        while True:
+            try:
+                found = list(search_result.getResults(start, batch_size))
+            except (OSError, RuntimeError, ValueError) as exc:
+                if mode == "fulltext":
+                    raise
+                errors.append({"archive_id": name, "error": str(exc)})
+                return
+            for article_path in found:
+                yield archive, name, str(article_path), search_mode, variant
+            if len(found) < batch_size:
+                return
+            start += len(found)
+
     for name, path in selected:
         try:
             archive = _archive(path)
@@ -787,7 +807,6 @@ def search(
                 estimate = search_result.getEstimatedMatches()
                 if estimate is not None:
                     archive_estimates.append(int(estimate))
-                found = search_result.getResults(0, offset + limit + 1)
                 if exact_path:
                     exact_path = str(exact_path)
                     if (name, exact_path) not in exact_seen:
@@ -795,17 +814,9 @@ def search(
                         exact_matches.append(
                             (archive, name, exact_path, "exact_title", variant)
                         )
-                for article_path in found:
-                    article_path = str(article_path)
-                    if (name, article_path) in exact_seen or (
-                        name,
-                        article_path,
-                    ) in other_seen:
-                        continue
-                    other_seen.add((name, article_path))
-                    other_matches.append(
-                        (archive, name, article_path, search_mode, variant)
-                    )
+                result_streams.append(
+                    _matches(archive, name, search_result, search_mode, variant)
+                )
             if archive_estimates:
                 estimated_matches += max(archive_estimates)
                 estimated_known = True
@@ -813,10 +824,8 @@ def search(
             if mode == "fulltext":
                 raise
             errors.append({"archive_id": name, "error": str(exc)})
-    matches = exact_matches + other_matches
-    # Cross-archive: exact_title must outrank fulltext noise from other
-    # archives, not just within its own archive's batch.
-    matches.sort(key=lambda m: 0 if m[3] == "exact_title" else 1)
+    # All exact hits precede lazy archive/variant streams, on every page.
+    matches = chain(exact_matches, chain.from_iterable(result_streams))
     canonical_matches: list[tuple[Archive, str, str, str, str]] = []
     canonical_seen: set[tuple[str, str]] = set()
     for archive, name, article_path, match_type, matched_query in matches:
@@ -859,7 +868,7 @@ def search(
         "query": query,
         "offset": offset,
         "next_offset": offset + len(page_matches)
-        if has_more and page_matches
+        if has_more and page_matches and offset + len(page_matches) <= 1000
         else None,
         "estimated_matches": estimated_matches if estimated_known else None,
         "results": results,

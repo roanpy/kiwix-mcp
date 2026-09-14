@@ -2,6 +2,8 @@
 
 Local MCP server for searching and reading ZIM archives.
 
+Requires Python 3.12 and macOS or Linux (the image cache uses POSIX file locks).
+
 Install the locked environment and place archives in:
 
 ```bash
@@ -35,6 +37,12 @@ Tools:
   `auto` (default), `fulltext`, or `title`. `fulltext` is strict and fails on
   archives without full-text index; `title` forces title-only suggestion lookup.
   Optional `language` and `flavour` filter archives in cross-archive mode only.
+  Redirect aliases are deduplicated before pagination. Follow `next_offset`
+  with the same query, archive selection, mode and filters. Search offsets are
+  bounded to 0–1000; narrow the query to explore beyond this window.
+  Cross-archive order is exact titles first, then archive/variant order, not
+  globally comparable relevance scores. `estimated_matches` sums the largest
+  per-variant estimate in each archive; it is not an exact unique-result count.
 - `inspect_article`: return a clean lead, heading outline with section URIs,
   MediaWiki infobox facts, redirect/canonical metadata, archive language/date,
   and reference count without returning the full article.
@@ -85,6 +93,23 @@ Idle stdio processes exit after 600 seconds by default. Override this with
 Any inbound MCP message, including initialization and ping, resets the timer.
 Use idle shutdown only with an MCP client that respawns stdio servers on the
 next call.
+
+Development checks (from the project directory):
+
+```bash
+uv sync --frozen
+uv run --frozen pytest -q
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+uv lock --check
+```
+
+For a portable source bundle, use `git archive` from a tested commit. It includes
+`uv.lock` but excludes local environments, image caches and ZIM data. Extract it,
+run `uv sync --frozen`, set `KIWIX_ARCHIVE_DIR` if needed, and use the stdio
+command above. A first installation needs internet access to download dependencies;
+article search and reading then work offline. The agent translates its answer to
+the user's language; this server returns source text without machine translation.
 
 This repository currently has no project license and is not an open-source
 release. Before redistribution, choose a project license and review the

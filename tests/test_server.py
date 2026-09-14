@@ -758,6 +758,91 @@ def test_search_pagination_keeps_exact_title_first(
     assert second["estimated_matches"] == 4
 
 
+def test_search_pages_past_redirects_across_archives(monkeypatch) -> None:
+    archives = {
+        name: _search_archive(
+            name=name,
+            has_fulltext_index=True,
+            has_entry_by_title=lambda query: False,
+        )
+        for name in ("first", "second")
+    }
+    archives["first"].get_entry_by_path = lambda path: SimpleNamespace(
+        path="canonical" if path.startswith("alias") else path, is_redirect=False
+    )
+    paths = {
+        "first": [f"alias-{i}" for i in range(70)] + ["tail-1", "tail-2"],
+        "second": ["second-1", "second-2"],
+    }
+    reads = []
+
+    def searcher(archive):
+        def get_results(start, limit):
+            reads.append((archive.name, start))
+            return paths[archive.name][start : start + limit]
+
+        return SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=get_results,
+                getEstimatedMatches=lambda: len(paths[archive.name]),
+            )
+        )
+
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [(name, Path(name)) for name in archives]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archives[path.name])
+    monkeypatch.setattr(server, "Searcher", searcher)
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {
+            "archive_id": name,
+            "article_path": path,
+        },
+    )
+    results = []
+    offset = 0
+    for _ in range(4):
+        page = server.search("topic", "*", limit=2, offset=offset)
+        results.extend(item["article_path"] for item in page["results"])
+        offset = page["next_offset"]
+        if offset is None:
+            break
+    assert offset is None
+    assert results == ["canonical", "tail-1", "tail-2", "second-1", "second-2"]
+    assert ("first", 64) in reads
+
+
+def test_search_last_offset_does_not_repeat_pages(monkeypatch) -> None:
+    archive = _search_archive(
+        has_fulltext_index=True, has_entry_by_title=lambda _: False
+    )
+    paths = [str(i) for i in range(1100)]
+    monkeypatch.setattr(server, "_select_paths", lambda _: [("test", Path("test"))])
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda _: SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: paths[start : start + limit],
+                getEstimatedMatches=lambda: len(paths),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {
+            "article_path": path,
+        },
+    )
+    page = server.search("topic", "test", offset=1000)
+    assert [item["article_path"] for item in page["results"]] == ["1000"]
+    assert page["next_offset"] is None
+
+
 def test_search_can_aggregate_all_archives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
