@@ -416,6 +416,29 @@ def test_dispatch_rejects_booleans_for_integer_arguments() -> None:
             server._coerce_arguments(tool, arguments)
 
 
+def test_dispatch_coerces_and_rejects_string_arguments() -> None:
+    """Numbers are usable as strings; lists/objects/null must be named."""
+    assert server._coerce_arguments("search", {"query": 2026}) == {"query": "2026"}
+    for tool, arguments, bad_type in [
+        ("search", {"archive_id": [1, 2]}, "list"),
+        ("search", {"query": {"a": 1}}, "dict"),
+        ("search", {"archive_id": None}, "NoneType"),
+        ("read_article", {"section": [1]}, "list"),
+    ]:
+        with pytest.raises(ValueError) as excinfo:
+            server._coerce_arguments(tool, arguments)
+        message = str(excinfo.value)
+        assert "must be a string" in message
+        assert bad_type in message
+
+
+def test_declared_type_reads_nullable_schema_types() -> None:
+    assert server._declared_type({"type": ["string", "null"]}) == "string"
+    assert server._declared_type({"type": ["null", "string"]}) == "string"
+    assert server._declared_type({"type": "integer"}) == "integer"
+    assert server._declared_type({}) == "string"
+
+
 def test_reference_label_miss_lists_available_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -815,6 +838,50 @@ def test_article_uri_round_trip_special_chars() -> None:
         parsed_id, parsed_path = server._parse_article_uri(uri)
         assert parsed_id == archive_id
         assert parsed_path == article_path
+
+
+def test_article_uri_round_trip_keeps_leading_slash() -> None:
+    """Real articles exist at paths like /etc/passwd; their uri must read back."""
+    for article_path in [
+        "/etc/passwd",
+        "/dev/null",
+        "/",
+        "trailing/",
+        "per%20cent",
+        "quote'",
+    ]:
+        uri = server._article_uri("en_all.zim", article_path)
+        archive_id, parsed_path = server._parse_article_uri(uri)
+        assert archive_id == "en_all.zim"
+        assert parsed_path == article_path, uri
+
+        section_uri = server._section_uri("en_all.zim", article_path, "History")
+        _, section_path = server._parse_article_uri(section_uri)
+        assert section_path == article_path, section_uri
+        assert server._parse_article_section(section_uri) == "History"
+
+
+def test_resource_reads_article_at_leading_slash_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = b"<html><body><p>passwd file</p></body></html>"
+    item = SimpleNamespace(size=len(html), mimetype="text/html", content=html)
+    entry = SimpleNamespace(
+        is_redirect=False,
+        path="/etc/passwd",
+        title="/etc/passwd",
+        get_item=lambda: item,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("en_all.zim", Path("en_all.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    uri = server._article_uri("en_all.zim", "/etc/passwd")
+    result = server._read_article_resource(uri)
+    assert result.meta["article_path"] == "/etc/passwd"
+    assert "passwd file" in result.contents[0].text
 
 
 def test_search_fulltext_mode_returns_results(

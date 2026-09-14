@@ -345,7 +345,10 @@ def _parse_article_uri(uri: str) -> tuple[str, str]:
         raise ValueError(f"Unsupported resource URI scheme: {parsed.scheme!r}")
     if parsed.netloc:
         archive_id = parsed.netloc
-        article_path = parsed.path.lstrip("/")
+        # Strip only the single separator slash: real ZIM paths can themselves
+        # start with "/" (for example the article about /etc/passwd), and
+        # lstrip() would eat that and break the round trip from _article_uri.
+        article_path = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
         if not article_path:
             raise ValueError(f"Invalid resource URI: {uri}")
     else:
@@ -4971,9 +4974,18 @@ _TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
     for tool in _TOOL_DEFINITIONS
 }
 
+
+def _declared_type(spec: dict[str, Any]) -> str:
+    """First non-null JSON Schema type, so ["string", "null"] reads as string."""
+    declared = spec.get("type", "string")
+    if isinstance(declared, list):
+        return next((item for item in declared if item != "null"), "string")
+    return str(declared)
+
+
 _TOOL_ARGUMENT_TYPES: dict[str, dict[str, str]] = {
     tool.name: {
-        key: spec.get("type", "string")
+        key: _declared_type(spec)
         for key, spec in tool.input_schema.get("properties", {}).items()
     }
     for tool in _TOOL_DEFINITIONS
@@ -5016,6 +5028,17 @@ def _coerce_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     f"Invalid argument for {name}: {key} must be a boolean, "
                     f"got {value!r}."
+                )
+        elif expected == "string" and not isinstance(value, str):
+            # A number where a string is declared (e.g. query=2026) is usable;
+            # a list, object or null would only surface as a bare AttributeError
+            # deep inside the tool, so reject it here with a real message.
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                coerced[key] = str(value)
+            else:
+                raise ValueError(
+                    f"Invalid argument for {name}: {key} must be a string, "
+                    f"got {type(value).__name__}."
                 )
     return coerced
 
