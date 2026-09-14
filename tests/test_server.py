@@ -507,6 +507,29 @@ def test_dispatch_rejects_guessed_argument_names() -> None:
         assert "missing required argument(s)" in message
 
 
+def test_dispatch_rejects_non_object_arguments() -> None:
+    """A client sending a string/list/scalar must get one clear message."""
+    for bad in ["query=x", '{"a": 1}', ["query"], 42, True]:
+        with pytest.raises(ValueError) as excinfo:
+            server._dispatch_tool("search", bad)
+        message = str(excinfo.value)
+        assert "expected a JSON object of named parameters" in message
+        assert type(bad).__name__ in message
+        assert "Valid arguments: archive_id" in message
+
+    with pytest.raises(ValueError, match="takes no arguments"):
+        server._dispatch_tool("list_archives", "unexpected")
+
+
+def test_dispatch_treats_null_arguments_as_empty() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        server._dispatch_tool("search", None)
+    assert "missing required argument(s): archive_id, query" in str(excinfo.value)
+
+    result = server._dispatch_tool("list_archives", None)
+    assert result["status"] in {"ok", "empty"}
+
+
 def test_dispatch_reports_missing_required_arguments() -> None:
     with pytest.raises(ValueError) as excinfo:
         server._dispatch_tool("search", {})

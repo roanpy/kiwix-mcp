@@ -5043,8 +5043,23 @@ def _coerce_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return coerced
 
 
-def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
+def _dispatch_tool(name: str, arguments: Any) -> Any:
     _LOGGER.info("tool=%s", name)
+    # A client that sends a JSON string, list or scalar instead of an object
+    # never reaches a tool; say so once instead of leaking an iteration error.
+    if arguments is None:
+        arguments = {}
+    elif not isinstance(arguments, dict):
+        allowed = sorted(_TOOL_ARGUMENTS.get(name, (set(), set()))[0])
+        expected = (
+            f"Valid arguments: {', '.join(allowed)}."
+            if allowed
+            else f"{name} takes no arguments."
+        )
+        raise ValueError(
+            f"Invalid arguments for {name}: expected a JSON object of named "
+            f"parameters, got {type(arguments).__name__}. {expected}"
+        )
     # Agents routinely guess parameter names (path, limit, id). Reject unknown or
     # missing keys here so the error names the valid parameters instead of
     # surfacing a bare Python TypeError the caller cannot act on.
@@ -5060,8 +5075,12 @@ def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
                 problems.append(f"missing required argument(s): {', '.join(missing)}")
             raise ValueError(
                 f"Invalid arguments for {name} ({'; '.join(problems)}). "
-                f"Valid arguments: {', '.join(sorted(allowed))}. "
-                f"Required: {', '.join(sorted(required)) or 'none'}."
+                + (
+                    f"Valid arguments: {', '.join(sorted(allowed))}. "
+                    f"Required: {', '.join(sorted(required)) or 'none'}."
+                    if allowed
+                    else f"{name} takes no arguments."
+                )
             )
         arguments = _coerce_arguments(name, arguments)
     if name == "list_archives":
