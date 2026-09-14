@@ -251,6 +251,8 @@ def test_mcp_tool_registry_is_stable() -> None:
         in tools["search"].output_schema["properties"]["results"]["items"]["properties"]
     )
     assert "mode" in tools["search"].input_schema["properties"]
+    assert "archive_id from list_archives" in tools["search"].description
+    assert "no limit parameter" in tools["read_article"].description
     assert "outline" in tools["inspect_article"].output_schema["properties"]
     assert "section" in tools["read_article"].input_schema["properties"]
     assert "offset" in tools["read_article"].input_schema["properties"]

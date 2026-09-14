@@ -122,11 +122,15 @@ class _ActivityReadStream:
 
 
 MCP_INSTRUCTIONS = (
-    "Search and read local ZIM archives. Use list_archives and choose archive_id "
-    "by language and collection: prefer full archives for coverage and maxi archives "
+    "Search and read local ZIM archives. Always call list_archives first, then pass "
+    "one returned archive_id exactly in every search, inspect_article, read_article, "
+    "list_references, and extract_image call; use archive_id='*' only for search "
+    "across archives. Choose the archive by language and collection: prefer full "
+    "archives for coverage and maxi archives "
     "when images matter; use title, date, and description to break ties. "
     "For long Wikipedia articles, call inspect_article first, then read_article with "
-    "a returned section anchor. Use list_references when a claim needs provenance. "
+    "a returned section anchor; read_article uses max_chars and offset, never limit. "
+    "Use list_references when a claim needs provenance. "
     "For images, inspect read_article metadata and prefer the image with "
     "primary=True; use its image_path with extract_image instead of index 0. "
     "For cross-archive comparison, call search with archive_id='*'. "
@@ -4407,14 +4411,30 @@ _TOOL_DEFINITIONS = [
     Tool(
         name="search",
         title="Search a ZIM archive",
-        description="Search one selected ZIM archive with exact-title priority, pagination, and match types; use archive_id='*' to aggregate all archives.",
+        description="Search a ZIM archive. Required: query and archive_id from list_archives; pass archive_id exactly, or '*' to aggregate archives. Use limit/offset for result pages.",
         inputSchema={
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "archive_id": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
-                "offset": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "query": {
+                    "type": "string",
+                    "description": "The article/topic to find.",
+                },
+                "archive_id": {
+                    "type": "string",
+                    "description": "Required exact archive_id from list_archives, or '*' for cross-archive search.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Number of search results, not article characters.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "description": "Use the previous search result's next_offset.",
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "fulltext", "title"],
@@ -4552,14 +4572,28 @@ _TOOL_DEFINITIONS = [
     Tool(
         name="read_article",
         title="Read a ZIM article",
-        description="Read bounded article text with optional image metadata and related links.",
+        description="Read one article. Required: archive_id and article_path from a search result. Use max_chars for text size and offset for continuation; this tool has no limit parameter.",
         inputSchema={
             "type": "object",
             "properties": {
-                "archive_id": {"type": "string"},
-                "article_path": {"type": "string"},
-                "query": {"type": "string"},
-                "max_chars": {"type": "integer", "minimum": 1000, "maximum": 50000},
+                "archive_id": {
+                    "type": "string",
+                    "description": "Required exact archive_id from the search result.",
+                },
+                "article_path": {
+                    "type": "string",
+                    "description": "Required article_path from the search result.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional term to center the first text window.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 50000,
+                    "description": "Maximum characters returned in this window; use this instead of limit.",
+                },
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
