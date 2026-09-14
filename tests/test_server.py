@@ -308,6 +308,68 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert "image_path" in tools["extract_image"].input_schema["properties"]
 
 
+def test_dispatch_rejects_guessed_argument_names() -> None:
+    """Agents guess parameter names; the error must name the valid ones."""
+    for tool, bad in [
+        ("search", {"path": "x"}),
+        ("inspect_article", {"path": "x", "archive_id": "a.zim"}),
+        ("read_article", {"path": "x"}),
+    ]:
+        with pytest.raises(ValueError) as excinfo:
+            server._dispatch_tool(tool, bad)
+        message = str(excinfo.value)
+        assert "unknown argument(s): path" in message
+        assert "Valid arguments:" in message
+        assert "missing required argument(s)" in message
+
+
+def test_dispatch_reports_missing_required_arguments() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        server._dispatch_tool("search", {})
+    assert "missing required argument(s): archive_id, query" in str(excinfo.value)
+
+
+def test_dispatch_argument_specs_match_published_schemas() -> None:
+    """The validation table is derived from the schemas, not hand-maintained."""
+    for tool in server._TOOL_DEFINITIONS:
+        allowed, required = server._TOOL_ARGUMENTS[tool.name]
+        assert allowed == set(tool.input_schema.get("properties", {}))
+        assert required == set(tool.input_schema.get("required", []))
+        assert required <= allowed
+
+
+def test_unknown_archive_error_lists_available_archives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("alpha.zim", "beta.zim"):
+        (tmp_path / name).write_bytes(b"zim")
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
+
+    with pytest.raises(ValueError) as excinfo:
+        server._select_paths("wikipedia_zh_all_maxi_2026_08_zim_main")
+
+    message = str(excinfo.value)
+    assert "Unknown archive" in message
+    assert "list_archives" in message
+    assert "alpha.zim" in message and "beta.zim" in message
+
+
+def test_missing_article_path_errors_are_actionable() -> None:
+    archive = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="article_path is required"):
+        server._entry(archive, "")
+    with pytest.raises(ValueError, match="article_path is required"):
+        server._raw_entry(archive, "   ")
+
+    def missing(path: str) -> object:
+        raise KeyError("Cannot find entry")
+
+    archive.get_entry_by_path = missing
+    with pytest.raises(ValueError, match="Article not found"):
+        server._entry(archive, "Nope")
+
+
 def test_mcp_resource_template_is_available() -> None:
     result = asyncio.run(server._list_resource_templates_v2(None, None))
     assert [item.uri_template for item in result.resource_templates] == [

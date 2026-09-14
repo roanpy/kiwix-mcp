@@ -186,6 +186,14 @@ the user's language; this server returns source text without machine translation
 To report a vulnerability, open a GitHub security advisory rather than a public
 issue.
 
+## Error messages
+
+Tool errors are written to be self-correcting, because the usual caller is an
+agent that guessed a parameter name or an `archive_id`. An unknown or missing
+argument returns the valid and required names for that tool, an unknown archive
+returns the available `archive_id` values, and a missing article points back to
+`search` and `list_archives`.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

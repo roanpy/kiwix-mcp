@@ -230,7 +230,21 @@ def _select_paths(archive_id: str) -> list[tuple[str, Path]]:
         logical_name = f"{path.stem}.zim" if path.suffix == ".zimaa" else name
         if requested in {name, path.stem, logical_name}:
             return [(name, path)]
-    raise ValueError(f"Unknown archive: {archive_id}")
+    # An agent that guesses an archive_id needs the real ones to recover, so the
+    # error carries them instead of dead-ending.
+    if not archives:
+        raise ValueError(
+            f"Unknown archive: {archive_id!r}. No archives found in "
+            f"{_archive_dir()} - add .zim files there or set KIWIX_ARCHIVE_DIR."
+        )
+    names = sorted(archives)
+    shown = ", ".join(names[:20])
+    if len(names) > 20:
+        shown += f", ... ({len(names) - 20} more)"
+    raise ValueError(
+        f"Unknown archive: {archive_id!r}. Pass one archive_id exactly as "
+        f"returned by list_archives. Available ({len(names)}): {shown}"
+    )
 
 
 @lru_cache(maxsize=8)
@@ -244,7 +258,7 @@ def _archive(path: Path) -> Archive:
 
 
 def _entry(archive: Archive, article_path: str):
-    entry = archive.get_entry_by_path(article_path)
+    entry = _raw_entry(archive, article_path)
     seen: set[str] = set()
     while entry.is_redirect:
         if entry.path in seen or len(seen) >= 8:
@@ -252,6 +266,26 @@ def _entry(archive: Archive, article_path: str):
         seen.add(entry.path)
         entry = entry.get_redirect_entry()
     return entry
+
+
+def _raw_entry(archive: Archive, article_path: str):
+    """Resolve a path without following redirects, with actionable errors.
+
+    Every path lookup goes through here so a bad or missing article_path
+    produces a message the caller can act on instead of a bare libzim KeyError.
+    """
+    if not str(article_path).strip():
+        raise ValueError(
+            "article_path is required. Pass an article_path from search results, "
+            "or an archive's main_entry_path from list_archives."
+        )
+    try:
+        return archive.get_entry_by_path(article_path)
+    except KeyError as exc:
+        raise ValueError(
+            f"Article not found: {article_path!r}. Use an article_path from "
+            f"search results in this archive."
+        ) from exc
 
 
 def _article_uri(archive_id: str, article_path: str) -> str:
@@ -1011,7 +1045,7 @@ def inspect_article(archive_id: str, article_path: str) -> dict[str, Any]:
         raise ValueError("archive_id is required")
     name, path = selected[0]
     archive = _archive(path)
-    requested_entry = archive.get_entry_by_path(article_path)
+    requested_entry = _raw_entry(archive, article_path)
     requested_path = str(requested_entry.path)
     entry = _entry(archive, article_path)
     item = entry.get_item()
@@ -4402,7 +4436,7 @@ _TOOL_DEFINITIONS = [
     Tool(
         name="list_archives",
         title="List ZIM archives",
-        description="List ZIM archives and metadata, including flavour, for archive selection.",
+        description="List the ZIM archives available here. This is the discovery entry point: call it first to get the exact archive_id values every other tool needs, plus language, flavour and main_entry_path.",
         inputSchema={"type": "object", "properties": {}},
         outputSchema={
             "type": "object",
@@ -4530,7 +4564,7 @@ _TOOL_DEFINITIONS = [
     Tool(
         name="inspect_article",
         title="Inspect a ZIM article",
-        description="Inspect an article before reading it: clean lead, heading outline, MediaWiki infobox facts, redirects, and reference count.",
+        description="Inspect one specific article by path: clean lead, heading outline, MediaWiki infobox facts, redirects, and reference count. It does not list or browse archive contents; use search to find articles and list_archives to see archives.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -4846,8 +4880,36 @@ _TOOL_DEFINITIONS = [
 ]
 
 
+# Derived from the published schemas so the interface has a single source of truth.
+_TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
+    tool.name: (
+        set(tool.input_schema.get("properties", {})),
+        set(tool.input_schema.get("required", [])),
+    )
+    for tool in _TOOL_DEFINITIONS
+}
+
+
 def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     _LOGGER.info("tool=%s", name)
+    # Agents routinely guess parameter names (path, limit, id). Reject unknown or
+    # missing keys here so the error names the valid parameters instead of
+    # surfacing a bare Python TypeError the caller cannot act on.
+    if name in _TOOL_ARGUMENTS:
+        allowed, required = _TOOL_ARGUMENTS[name]
+        unknown = sorted(set(arguments) - allowed)
+        missing = sorted(required - set(arguments))
+        if unknown or missing:
+            problems = []
+            if unknown:
+                problems.append(f"unknown argument(s): {', '.join(unknown)}")
+            if missing:
+                problems.append(f"missing required argument(s): {', '.join(missing)}")
+            raise ValueError(
+                f"Invalid arguments for {name} ({'; '.join(problems)}). "
+                f"Valid arguments: {', '.join(sorted(allowed))}. "
+                f"Required: {', '.join(sorted(required)) or 'none'}."
+            )
     if name == "list_archives":
         return list_archives()
     if name == "search":
