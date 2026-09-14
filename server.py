@@ -288,6 +288,19 @@ def _raw_entry(archive: Archive, article_path: str):
         ) from exc
 
 
+def _too_large(size: int) -> None:
+    raise ValueError(
+        f"Article is too large to read safely: {size} bytes. "
+        f"Call inspect_article for its outline, then read_article with a section."
+    )
+
+
+def _not_text(mimetype: str) -> None:
+    raise ValueError(
+        f"Article is not text: {mimetype}. Use extract_image for image entries."
+    )
+
+
 def _article_uri(archive_id: str, article_path: str) -> str:
     return f"kiwix://{quote(str(archive_id), safe='')}/{quote(article_path, safe='/')}"
 
@@ -838,7 +851,8 @@ def search(
                 if mode == "fulltext":
                     if not archive.has_fulltext_index:
                         raise ValueError(
-                            f"Archive does not support full-text search: {name}"
+                            f"Archive does not support full-text search: {name}. "
+                            f"Use mode='auto' or mode='title' for this archive."
                         )
                     search_result = Searcher(archive).search(Query().set_query(variant))
                     search_mode = "fulltext"
@@ -885,7 +899,10 @@ def search(
                 estimated_matches += max(archive_estimates)
                 estimated_known = True
         except (OSError, RuntimeError, ValueError) as exc:
-            if mode == "fulltext":
+            # A single explicitly chosen archive stays strict; in cross-archive
+            # mode one archive without a full-text index must not discard the
+            # results the other archives could still provide.
+            if mode == "fulltext" and not cross_archive:
                 raise
             errors.append({"archive_id": name, "error": str(exc)})
     # All exact hits precede lazy archive/variant streams, on every page.
@@ -963,9 +980,9 @@ def read_article(
     entry = _entry(archive, article_path)
     item = entry.get_item()
     if item.size > MAX_ARTICLE_BYTES:
-        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+        _too_large(item.size)
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
-        raise ValueError(f"Article is not text: {item.mimetype}")
+        _not_text(item.mimetype)
     if limit is not None and max_chars == 12000:
         max_chars = limit
     max_chars = min(max(int(max_chars), 1000), 50000)
@@ -1050,9 +1067,9 @@ def inspect_article(archive_id: str, article_path: str) -> dict[str, Any]:
     entry = _entry(archive, article_path)
     item = entry.get_item()
     if item.size > MAX_ARTICLE_BYTES:
-        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+        _too_large(item.size)
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
-        raise ValueError(f"Article is not text: {item.mimetype}")
+        _not_text(item.mimetype)
 
     content = bytes(item.content)
     outline: list[dict[str, Any]] = []
@@ -1116,7 +1133,7 @@ def list_references(
     entry = _entry(archive, article_path)
     item = entry.get_item()
     if item.size > MAX_ARTICLE_BYTES:
-        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+        _too_large(item.size)
     if "html" not in item.mimetype.lower():
         raise ValueError("References are only available for HTML articles")
 
@@ -4155,14 +4172,19 @@ _LANGUAGE_ALIASES = {
 }
 _SEE_ALSO_LABELS = {
     "see also",
+    "further reading",
     "参见",
     "參見",
+    "参看",
+    "參看",
     "参阅",
     "參閱",
     "另见",
     "另見",
     "延伸阅读",
     "延伸閱讀",
+    "扩展阅读",
+    "擴展閱讀",
 }
 
 
@@ -4239,10 +4261,17 @@ def _find_links(
             notes.append({"label": label, "links": note_links})
 
     for h2 in root.find_all("h2"):
-        label = (h2.get("id") or "").replace("_", " ").strip().lower()
-        if not label:
-            label = h2.get_text(" ", strip=True).lower()
-        if label in _SEE_ALSO_LABELS:
+        # MediaWiki language-conversion markup leaks into ids ("扩-{展}-阅读"),
+        # so normalise the id and also consider the visible heading text.
+        heading_id = (
+            (h2.get("id") or "")
+            .replace("_", " ")
+            .replace("-{", "")
+            .replace("}-", "")
+            .strip()
+            .lower()
+        )
+        if {heading_id, h2.get_text(" ", strip=True).lower()} & _SEE_ALSO_LABELS:
             for tag in h2.find_all_next():
                 if tag.name == "h2":
                     break
@@ -4428,7 +4457,13 @@ def extract_image(
             -1,
         )
         if image_index < 0:
-            raise ValueError(f"Image path not found in article: {image_path}")
+            available = [image["image_path"] for image in images][:5]
+            raise ValueError(
+                f"Image path not found in article: {image_path}. "
+                f"Use an image_path from read_article's images list"
+                + (f", for example: {', '.join(available)}" if available else "")
+                + "."
+            )
     return _extract_image(archive, article_path, image_index)
 
 
@@ -4889,6 +4924,48 @@ _TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
     for tool in _TOOL_DEFINITIONS
 }
 
+_TOOL_ARGUMENT_TYPES: dict[str, dict[str, str]] = {
+    tool.name: {
+        key: spec.get("type", "string")
+        for key, spec in tool.input_schema.get("properties", {}).items()
+    }
+    for tool in _TOOL_DEFINITIONS
+}
+
+
+def _coerce_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Coerce scalar arguments to their declared types.
+
+    Clients routinely send numbers as strings, which otherwise surfaces as a
+    bare TypeError deep inside a tool instead of a usable message.
+    """
+    types = _TOOL_ARGUMENT_TYPES.get(name, {})
+    coerced = dict(arguments)
+    for key, value in arguments.items():
+        expected = types.get(key)
+        if expected == "integer" and not isinstance(value, bool):
+            if isinstance(value, int):
+                continue
+            try:
+                coerced[key] = int(str(value).strip())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Invalid argument for {name}: {key} must be an integer, "
+                    f"got {value!r}."
+                ) from None
+        elif expected == "boolean" and not isinstance(value, bool):
+            text = str(value).strip().lower()
+            if text in {"true", "1", "yes"}:
+                coerced[key] = True
+            elif text in {"false", "0", "no"}:
+                coerced[key] = False
+            else:
+                raise ValueError(
+                    f"Invalid argument for {name}: {key} must be a boolean, "
+                    f"got {value!r}."
+                )
+    return coerced
+
 
 def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     _LOGGER.info("tool=%s", name)
@@ -4910,6 +4987,7 @@ def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
                 f"Valid arguments: {', '.join(sorted(allowed))}. "
                 f"Required: {', '.join(sorted(required)) or 'none'}."
             )
+        arguments = _coerce_arguments(name, arguments)
     if name == "list_archives":
         return list_archives()
     if name == "search":
@@ -4922,7 +5000,10 @@ def _dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
         return list_references(**arguments)
     if name == "extract_image":
         return extract_image(**arguments)
-    raise ValueError(f"Unknown tool: {name}")
+    raise ValueError(
+        f"Unknown tool: {name!r}. Available tools: "
+        f"{', '.join(tool.name for tool in _TOOL_DEFINITIONS)}."
+    )
 
 
 def _json_content(value: Any) -> TextContent:
@@ -4983,9 +5064,9 @@ def _read_article_resource(uri: str) -> ReadResourceResult:
     entry = _entry(archive, article_path)
     item = entry.get_item()
     if item.size > MAX_ARTICLE_BYTES:
-        raise ValueError(f"Article is too large to read safely: {item.size} bytes")
+        _too_large(item.size)
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
-        raise ValueError(f"Article is not text: {item.mimetype}")
+        _not_text(item.mimetype)
 
     content = bytes(item.content)
     selected_section: dict[str, Any] | None = None

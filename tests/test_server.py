@@ -308,6 +308,119 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert "image_path" in tools["extract_image"].input_schema["properties"]
 
 
+def test_links_recognize_see_also_despite_converter_markup_id() -> None:
+    """zh.wikipedia emits ids like "扩-{展}-阅读"; match on id or heading text."""
+    archive = SimpleNamespace(has_entry_by_path=lambda path: True)
+    soup = server.BeautifulSoup(
+        '<h2 id="扩-{展}-阅读">扩展阅读</h2>'
+        '<ul><li><a href="extra">Extra</a></li></ul>'
+        "<h2>参考文献</h2>",
+        "html.parser",
+    )
+    see_also, _, _ = server._find_links(archive, soup, "article", "zh_all.zim")
+    assert [item["article_path"] for item in see_also] == ["extra"]
+
+
+def test_links_recognize_cankan_and_further_reading_labels() -> None:
+    archive = SimpleNamespace(has_entry_by_path=lambda path: True)
+    for heading, path, archive_id in [
+        ('<h2 id="參看">參看</h2>', "quantum", "zh_all.zim"),
+        ('<h2 id="参看">参看</h2>', "quantum", "zh_all.zim"),
+        ('<h2 id="Further_reading">Further reading</h2>', "book", "en_all.zim"),
+    ]:
+        soup = server.BeautifulSoup(
+            f'{heading}<ul><li><a href="{path}">X</a></li></ul><h2>References</h2>',
+            "html.parser",
+        )
+        see_also, _, _ = server._find_links(archive, soup, "article", archive_id)
+        assert [item["article_path"] for item in see_also] == [path], heading
+
+
+def test_cross_archive_fulltext_survives_archive_without_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One index-less archive must not discard the other archives' results."""
+    good = _search_archive(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        name="good.zim",
+    )
+    bad = SimpleNamespace(has_fulltext_index=False, name="bad.zim")
+    archives = {"good.zim": good, "bad.zim": bad}
+    search_result = SimpleNamespace(
+        getResults=lambda start, limit: ["a", "b"],
+        getEstimatedMatches=lambda: 2,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [(n, Path(n)) for n in archives]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archives[path.name])
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: search_result),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {"article_path": path},
+    )
+
+    result = server.search("topic", "*", mode="fulltext", limit=5)
+
+    assert result["status"] == "ok"
+    assert [item["article_path"] for item in result["results"]] == ["a", "b"]
+    assert [error["archive_id"] for error in result["errors"]] == ["bad.zim"]
+    assert "does not support full-text search" in result["errors"][0]["error"]
+
+
+def test_single_archive_fulltext_stays_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = SimpleNamespace(
+        has_fulltext_index=False, name="only.zim", has_entry_by_title=lambda q: False
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("only.zim", Path("only.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+
+    with pytest.raises(ValueError, match="does not support full-text search"):
+        server.search("topic", "only.zim", mode="fulltext")
+
+
+def test_dispatch_coerces_string_scalars() -> None:
+    assert server._coerce_arguments("extract_image", {"image_index": "3"}) == {
+        "image_index": 3
+    }
+    assert server._coerce_arguments("read_article", {"include_links": "false"}) == {
+        "include_links": False
+    }
+    assert server._coerce_arguments("read_article", {"image_offset": 2}) == {
+        "image_offset": 2
+    }
+    with pytest.raises(ValueError, match="must be an integer"):
+        server._coerce_arguments("extract_image", {"image_index": "abc"})
+    with pytest.raises(ValueError, match="must be a boolean"):
+        server._coerce_arguments("read_article", {"include_links": "maybe"})
+
+
+def test_unknown_tool_lists_available_tools() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        server._dispatch_tool("list_zims", {})
+    message = str(excinfo.value)
+    assert "Unknown tool" in message
+    for name in (
+        "list_archives",
+        "search",
+        "inspect_article",
+        "read_article",
+        "list_references",
+        "extract_image",
+    ):
+        assert name in message
+
+
 def test_dispatch_rejects_guessed_argument_names() -> None:
     """Agents guess parameter names; the error must name the valid ones."""
     for tool, bad in [
