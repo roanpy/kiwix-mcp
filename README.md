@@ -1,5 +1,7 @@
 # kiwix-mcp
 
+English | [简体中文](README.zh-CN.md)
+
 An MCP server that gives an AI agent offline access to Kiwix ZIM archives:
 Wikipedia, Wiktionary, Wikibooks, Stack Exchange dumps, and any other ZIM
 collection. Everything runs locally against files on disk, with no network
