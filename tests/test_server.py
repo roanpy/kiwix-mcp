@@ -29,6 +29,23 @@ def test_empty_archive_directory(
     assert result["archives"] == []
 
 
+def test_archive_dir_resolution_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Explicit override always wins.
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
+    assert server._archive_dir() == tmp_path
+
+    # Blank override counts as unset; legacy path wins only when it exists.
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", "   ")
+    legacy = tmp_path / "legacy"
+    monkeypatch.setattr(server, "LEGACY_ARCHIVE_DIR", legacy)
+    monkeypatch.setattr(server, "DEFAULT_ARCHIVE_DIR", tmp_path / "default")
+    assert server._archive_dir() == tmp_path / "default"
+    legacy.mkdir()
+    assert server._archive_dir() == legacy
+
+
 def test_list_archives_exposes_zim_flavour(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

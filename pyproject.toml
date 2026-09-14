@@ -1,6 +1,10 @@
 [project]
 name = "kiwix-mcp"
 version = "0.1.0"
+description = "Local MCP server for searching and reading Kiwix ZIM archives offline"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "beautifulsoup4>=4.13,<5",

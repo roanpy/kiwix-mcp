@@ -1,30 +1,72 @@
 # kiwix-mcp
 
-Local MCP server for searching and reading ZIM archives.
+An MCP server that gives an AI agent offline access to Kiwix ZIM archives:
+Wikipedia, Wiktionary, Wikibooks, Stack Exchange dumps, and any other ZIM
+collection. Everything runs locally against files on disk, with no network
+access at query time, no account and no API key.
+
+The point is provenance. Rather than leaning on a model's memory, the agent
+searches a dated offline snapshot, reads the actual article text, and can point
+back to the archive it came from through a `kiwix://` URI. The server is
+read-only: it never writes to a ZIM file.
 
 Requires Python 3.12 and macOS or Linux (the image cache uses POSIX file locks).
 
-Install the locked environment and place archives in:
+## Install
 
 ```bash
 uv sync --frozen
-mkdir -p ~/.chroma_db/kiwix/archives
-```
-
-Run over stdio:
-
-```bash
 uv run --frozen python server.py
 ```
 
-For Hermes, set `lazy: true` and `idle_timeout_seconds: 900` on this server.
-Keep `supports_parallel_tool_calls` unset: separate clients already use separate
-stdio processes, while one Agent session stays serialized for predictable libzim
-access.
+## Get archives and point the server at them
+
+Download ZIM files from the [Kiwix library](https://library.kiwix.org/), for
+example `wikipedia_en_all_maxi_2026-06.zim`. Archives are read directly from
+disk and are never modified.
+
+The default archive directory is `~/.local/share/kiwix-mcp/archives`:
+
+```bash
+mkdir -p ~/.local/share/kiwix-mcp/archives
+```
+
+Or point the server at wherever your archives live:
+
+```bash
+export KIWIX_ARCHIVE_DIR=/path/to/your/zim/files
+```
+
+Single-file `.zim` and split `.zimaa` archives are both detected. If archives
+are present but not showing up, call `list_archives` — it reports the directory
+it read along with any per-archive error.
+
+## Configure your MCP client
+
+The server speaks MCP over stdio. Register it with your client, for example:
+
+```json
+{
+  "mcpServers": {
+    "kiwix": {
+      "command": "uv",
+      "args": ["run", "--frozen", "python", "server.py"],
+      "cwd": "/path/to/kiwix-mcp",
+      "env": { "KIWIX_ARCHIVE_DIR": "/path/to/your/zim/files" }
+    }
+  }
+}
+```
+
+Each client launch gets its own process, so concurrent clients do not share
+state. Calls inside one session are serialized, which keeps libzim access
+predictable. Lazy start and an idle timeout on the client side work well with
+this server; on its own it exits after 10 minutes idle (see
+`KIWIX_MCP_IDLE_TIMEOUT`).
 
 The server uses the MCP 2.x low-level `Server` API and keeps the legacy
-initialize/session path available for older MCP clients. The tool names and
-stdio command remain unchanged.
+initialize/session path available for older MCP clients. Tool names and the
+stdio command are part of the interface and stay stable.
 
 Tools:
 
@@ -58,7 +100,8 @@ Tools:
   URLs, or select a visible marker such as `1`, `a`, or `note 1` via
   `citation_label`.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
-  fallback for clients such as pi. Prefer the entry with `primary=True` unless
+  fallback for clients that cannot render MCP image content. Prefer the entry
+  with `primary=True` unless
   another image is wanted, then pass the chosen entry's `image_path`.
   Temporary images are deduplicated and capped at the 16 most recently used files.
 
@@ -76,9 +119,10 @@ MCP resources (2.x):
 - Resource clients can still load article text through `read_resource` when images are
   unavailable.
 
-Set `KIWIX_ARCHIVE_DIR` to use another archive directory. Single-file `.zim`
-and split `.zimaa` archives are detected. Existing local installations that
-store archives elsewhere should keep setting this variable explicitly.
+Archives older than 0.1.0 previously defaulted to `~/.chroma_db/kiwix/archives`.
+That path is still used when it exists and `KIWIX_ARCHIVE_DIR` is unset, so
+existing installations keep working; setting the variable explicitly is
+preferred.
 
 When `read_article` returns `next_offset`, call it again with the same
 `archive_id` and `article_path` plus that `offset` to continue a long article.
@@ -122,6 +166,30 @@ command above. A first installation needs internet access to download dependenci
 article search and reading then work offline. The agent translates its answer to
 the user's language; this server returns source text without machine translation.
 
-This repository currently has no project license and is not an open-source
-release. Before redistribution, choose a project license and review the
-GPL-3.0 license shipped with the `libzim` dependency.
+## Security model
+
+- Read-only. No tool writes to an archive. `extract_image` is the only tool that
+  touches the filesystem outside reads: it caches decoded images as temporary
+  files under the system temp directory, deduplicated and capped at 16 files.
+- No network access at query time. Article text, images and metadata come from
+  local ZIM files. The only network use is downloading dependencies at install
+  time.
+- Local paths stay local. `list_archives` exposes archive filenames from the
+  configured directory, so point `KIWIX_ARCHIVE_DIR` at a directory that holds
+  only archives you are happy to describe to your agent.
+- Untrusted content. Article text is extracted from ZIM data and passed to the
+  model as-is. Treat retrieved text as data; it is not an instruction channel.
+- Idle shutdown. stdio processes exit after 600 seconds without traffic by
+  default (`KIWIX_MCP_IDLE_TIMEOUT=0` disables this).
+
+To report a vulnerability, open a GitHub security advisory rather than a public
+issue.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+This is not a free choice: the server links against
+[`libzim`](https://github.com/openzim/python-libzim), which is licensed
+GPL-3.0-or-later, so distributed builds must be GPL-compatible. That matches the
+rest of the Kiwix tooling.
