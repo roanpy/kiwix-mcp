@@ -10,7 +10,8 @@ searches a dated offline snapshot, reads the actual article text, and can point
 back to the archive it came from through a `kiwix://` URI. The server is
 read-only: it never writes to a ZIM file.
 
-Requires Python 3.12 and macOS or Linux (the image cache uses POSIX file locks).
+Requires Python 3.12 or newer (tested on 3.12, 3.13 and 3.14) and macOS or
+Linux — the image cache uses POSIX file locks.
 
 ## Install
 
