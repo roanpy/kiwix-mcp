@@ -233,6 +233,36 @@ def test_read_article_is_not_truncated_when_query_window_contains_all_text(
     assert result["text"] == text[567:]
 
 
+def test_max_chars_is_not_overridden_by_limit_when_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit max_chars equal to the default must still win over limit."""
+    text = "x" * 20000
+    item = SimpleNamespace(
+        size=len(text), mimetype="text/plain", content=text.encode(), title="T"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="T", title="T", get_item=lambda: item
+    )
+    monkeypatch.setattr(server, "_select_paths", lambda _: [("t.zim", Path("t.zim"))])
+    monkeypatch.setattr(server, "_archive", lambda _: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    def chars(**kwargs) -> int:
+        return len(
+            server.read_article(
+                "t.zim", "T", include_images=False, include_links=False, **kwargs
+            )["text"]
+        )
+
+    assert chars() == server.DEFAULT_MAX_CHARS
+    assert chars(limit=1500) == 1500
+    assert chars(max_chars=1500) == 1500
+    # The regression: an explicit max_chars equal to the default used to lose.
+    assert chars(max_chars=server.DEFAULT_MAX_CHARS, limit=1500) == 12000
+    assert chars(max_chars=1500, limit=9000) == 1500
+
+
 def test_read_article_accepts_limit_compatibility_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -26,7 +26,6 @@ import mimetypes
 import os
 import posixpath
 import sys
-import tempfile
 from functools import lru_cache
 from itertools import chain
 from logging.handlers import RotatingFileHandler
@@ -57,8 +56,17 @@ DEFAULT_ARCHIVE_DIR = Path.home() / ".local" / "share" / "kiwix-mcp" / "archives
 # Earlier releases defaulted to this path; still honoured when it exists so
 # pre-0.1.x installations keep working without setting KIWIX_ARCHIVE_DIR.
 LEGACY_ARCHIVE_DIR = Path.home() / ".chroma_db" / "kiwix" / "archives"
-IMAGE_TEMP_DIR = Path(tempfile.gettempdir()) / "kiwix-mcp"
+_IMAGE_DIR_OVERRIDE = os.environ.get("KIWIX_MCP_IMAGE_DIR", "").strip()
+# A stable location, because extract_image hands clients a file_path they read
+# after the call returns: TMPDIR varies per client environment and /tmp is
+# cleared on reboot, so a temp-based base split the cache and lost files.
+IMAGE_TEMP_DIR = (
+    Path(_IMAGE_DIR_OVERRIDE).expanduser()
+    if _IMAGE_DIR_OVERRIDE
+    else Path.home() / ".cache" / "kiwix-mcp" / "images"
+)
 MAX_ARTICLE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_CHARS = 12_000
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TEMP_IMAGES = 16
 MAX_IMAGE_REFERENCES = 30
@@ -250,7 +258,10 @@ def _select_paths(archive_id: str) -> list[tuple[str, Path]]:
     )
 
 
-@lru_cache(maxsize=8)
+# Bounded, but comfortably above a realistic archive count: with maxsize below
+# the number of archives, list_archives evicts and reopens every one each round.
+# ponytail: fixed bound; key on archive count if collections get huge
+@lru_cache(maxsize=32)
 def _open_archive(path: str, mtime_ns: int) -> Archive:
     del mtime_ns
     return Archive(Path(path))
@@ -996,7 +1007,7 @@ def read_article(
     archive_id: str,
     article_path: str,
     query: str = "",
-    max_chars: int = 12000,
+    max_chars: int | None = None,
     offset: int = 0,
     include_images: bool = True,
     include_links: bool = True,
@@ -1016,8 +1027,11 @@ def read_article(
         _too_large(item.size)
     if not (item.mimetype.startswith("text/") or "html" in item.mimetype):
         _not_text(item.mimetype)
-    if limit is not None and max_chars == 12000:
-        max_chars = limit
+    # `max_chars` is canonical, `limit` is a legacy alias. None marks "not
+    # supplied" so an explicit max_chars=12000 is no longer indistinguishable
+    # from the default and silently overridden by limit.
+    if max_chars is None:
+        max_chars = DEFAULT_MAX_CHARS if limit is None else limit
     max_chars = min(max(int(max_chars), 1000), 50000)
     offset = max(int(offset), 0)
     content = bytes(item.content)
@@ -4405,7 +4419,7 @@ def _resolve_image_path(article_path: str, src: str) -> str:
 
 
 def _cache_image(raw: bytes, mimetype: str) -> Path:
-    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = IMAGE_TEMP_DIR / ".lock"
     with lock_path.open("a+b") as lock_file:
         # Every stdio client has its own process, but all clients share this cache.

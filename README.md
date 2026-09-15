@@ -172,8 +172,11 @@ the user's language; this server returns source text without machine translation
 ## Security model
 
 - Read-only. No tool writes to an archive. `extract_image` is the only tool that
-  touches the filesystem outside reads: it caches decoded images as temporary
-  files under the system temp directory, deduplicated and capped at 16 files.
+  touches the filesystem outside reads: it caches decoded images under
+  `~/.cache/kiwix-mcp/images`, deduplicated and capped at 16 files. Set
+  `KIWIX_MCP_IMAGE_DIR` to move that cache. The location is deliberately stable
+  rather than a temp directory, because `file_path` is handed to clients that
+  read it after the call returns.
 - No network access at query time. Article text, images and metadata come from
   local ZIM files. The only network use is downloading dependencies at install
   time.
