@@ -67,6 +67,13 @@ IMAGE_TEMP_DIR = (
 )
 MAX_ARTICLE_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_CHARS = 12_000
+# Some ZIM entries are script-driven app shells (PhET simulations, for example)
+# whose content never reaches the HTML, so both readers explain the blank result.
+NO_TEXT_NOTE = (
+    "No extractable text in this entry. It is probably an interactive or "
+    "script-driven page rather than a readable document; try another entry "
+    "or archive."
+)
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TEMP_IMAGES = 16
 MAX_IMAGE_REFERENCES = 30
@@ -950,10 +957,10 @@ def search(
                 raise
             errors.append({"archive_id": name, "error": str(exc)})
     # All exact hits precede lazy archive/variant streams, on every page.
-    matches = chain(exact_matches, chain.from_iterable(result_streams))
+    match_stream = chain(exact_matches, chain.from_iterable(result_streams))
     canonical_matches: list[tuple[Archive, str, str, str, str]] = []
     canonical_seen: set[tuple[str, str]] = set()
-    for archive, name, article_path, match_type, matched_query in matches:
+    for archive, name, article_path, match_type, matched_query in match_stream:
         try:
             canonical_path = str(_entry(archive, article_path).path)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1078,6 +1085,8 @@ def read_article(
         "language": _archive_metadata(archive, "Language"),
         "archive_date": _archive_metadata(archive, "Date"),
     }
+    if not text.strip():
+        result["note"] = NO_TEXT_NOTE
     if include_images:
         images = images or []
         image_offset = min(max(int(image_offset), 0), len(images))
@@ -1141,7 +1150,7 @@ def inspect_article(archive_id: str, article_path: str) -> dict[str, Any]:
         lead = text[:MAX_LEAD_CHARS].rstrip()
         total_chars = len(text)
 
-    return {
+    result: dict[str, Any] = {
         "status": "ok",
         "archive_id": name,
         "requested_article_path": requested_path,
@@ -1162,6 +1171,9 @@ def inspect_article(archive_id: str, article_path: str) -> dict[str, Any]:
         "language": _archive_metadata(archive, "Language"),
         "archive_date": _archive_metadata(archive, "Date"),
     }
+    if total_chars == 0:
+        result["note"] = NO_TEXT_NOTE
+    return result
 
 
 def list_references(
@@ -4710,6 +4722,10 @@ _TOOL_DEFINITIONS = [
                 "canonical_url": {"type": ["string", "null"]},
                 "language": {"type": ["string", "null"]},
                 "archive_date": {"type": ["string", "null"]},
+                "note": {
+                    "type": "string",
+                    "description": "Present only when the entry yielded no extractable text.",
+                },
             },
             "required": [
                 "status",
@@ -4793,6 +4809,10 @@ _TOOL_DEFINITIONS = [
                 "requested_article_path": {"type": "string"},
                 "redirected": {"type": "boolean"},
                 "section": {"type": ["object", "null"]},
+                "note": {
+                    "type": "string",
+                    "description": "Present only when the entry yielded no extractable text.",
+                },
                 "canonical_url": {"type": ["string", "null"]},
                 "language": {"type": ["string", "null"]},
                 "archive_date": {"type": ["string", "null"]},
@@ -5064,10 +5084,10 @@ def _dispatch_tool(name: str, arguments: Any) -> Any:
     if arguments is None:
         arguments = {}
     elif not isinstance(arguments, dict):
-        allowed = sorted(_TOOL_ARGUMENTS.get(name, (set(), set()))[0])
+        allowed_names = sorted(_TOOL_ARGUMENTS.get(name, (set(), set()))[0])
         expected = (
-            f"Valid arguments: {', '.join(allowed)}."
-            if allowed
+            f"Valid arguments: {', '.join(allowed_names)}."
+            if allowed_names
             else f"{name} takes no arguments."
         )
         raise ValueError(

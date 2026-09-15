@@ -88,6 +88,9 @@ Tools:
   Cross-archive order is exact titles first, then archive/variant order, not
   globally comparable relevance scores. `estimated_matches` sums the largest
   per-variant estimate in each archive; it is not an exact unique-result count.
+  If two archives cover the same material, the same `article_path` can appear
+  once per archive — that is deliberate, since the archives are different
+  snapshots. Search one archive, or filter by `flavour`, to avoid the repeat.
 - `inspect_article`: return a clean lead, heading outline with section URIs,
   MediaWiki infobox facts, redirect/canonical metadata, archive language/date,
   and reference count without returning the full article.
@@ -204,6 +207,12 @@ underscores where the title has spaces. Passing the readable title still works,
 because the server falls back to a title lookup, but building a path by hand or
 URL-encoding a title does not. When a path cannot be resolved, the error names a
 close match from the archive's suggestion index when one exists.
+
+Some ZIM entries carry no readable text at all — PhET simulations, for example,
+are HTML shells whose content is produced by JavaScript. `read_article` and
+`inspect_article` return `status: "ok"` with `total_chars: 0` plus a `note`
+explaining why, so a blank result is not mistaken for a broken archive. Those
+entries are still discoverable through title search.
 
 ## License
 

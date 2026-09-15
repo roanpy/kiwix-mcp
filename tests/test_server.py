@@ -233,6 +233,52 @@ def test_read_article_is_not_truncated_when_query_window_contains_all_text(
     assert result["text"] == text[567:]
 
 
+def _script_page_archive(text: str) -> SimpleNamespace:
+    """An HTML entry whose body carries no text, like a PhET simulation shell."""
+    html = text.encode()
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html, title="Simulation"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="sim.html", title="光的折射", get_item=lambda: item
+    )
+    return SimpleNamespace(), entry
+
+
+def test_script_driven_page_gets_an_explanatory_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank extraction must explain itself rather than look like a bug."""
+    # Mirrors a real PhET shell: a <title>, an empty body, and only scripts.
+    archive, entry = _script_page_archive(
+        "<html><head><title>光的折射</title></head>"
+        '<body><script src="app.js"></script></body></html>'
+    )
+    monkeypatch.setattr(server, "_select_paths", lambda _: [("t.zim", Path("t.zim"))])
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+    monkeypatch.setattr(server, "_entry", lambda a, p: entry)
+    monkeypatch.setattr(server, "_raw_entry", lambda a, p: entry)
+
+    inspected = server.inspect_article("t.zim", "sim.html")
+    assert inspected["total_chars"] == 0
+    assert inspected["note"] == server.NO_TEXT_NOTE
+
+    read = server.read_article(
+        "t.zim", "sim.html", include_images=False, include_links=False
+    )
+    assert read["text"] == ""
+    assert read["note"] == server.NO_TEXT_NOTE
+
+    # A page with real text must not carry the note.
+    archive2, entry2 = _script_page_archive(
+        "<html><body><p>Real text here</p></body></html>"
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive2)
+    monkeypatch.setattr(server, "_entry", lambda a, p: entry2)
+    monkeypatch.setattr(server, "_raw_entry", lambda a, p: entry2)
+    assert "note" not in server.inspect_article("t.zim", "sim.html")
+
+
 def test_max_chars_is_not_overridden_by_limit_when_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
