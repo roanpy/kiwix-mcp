@@ -621,6 +621,11 @@ def test_dispatch_argument_specs_match_published_schemas() -> None:
         assert required <= allowed
 
 
+def test_tool_input_schemas_reject_unknown_properties() -> None:
+    for tool in server._TOOL_DEFINITIONS:
+        assert tool.input_schema["additionalProperties"] is False
+
+
 def test_unknown_archive_error_lists_available_archives(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -650,6 +655,47 @@ def test_article_path_falls_back_to_title() -> None:
     assert server._entry(archive, "Machine learning") is canonical
 
 
+def test_article_path_accepts_one_url_encoded_fallback() -> None:
+    decoded = "中国大陆区 App_Store"
+    encoded = server.quote(decoded, safe="")
+    canonical = SimpleNamespace(path=decoded, is_redirect=False)
+    calls: list[str] = []
+
+    def get_entry_by_path(path: str):
+        calls.append(path)
+        if path == decoded:
+            return canonical
+        raise KeyError(path)
+
+    archive = SimpleNamespace(
+        get_entry_by_path=get_entry_by_path,
+        has_entry_by_title=lambda title: False,
+    )
+
+    assert server._entry(archive, encoded) is canonical
+    assert calls == [encoded, decoded]
+
+
+def test_article_path_prefers_literal_percent_encoded_key() -> None:
+    literal = "%E4%B8%AD"
+    canonical = SimpleNamespace(path=literal, is_redirect=False)
+    calls: list[str] = []
+
+    def get_entry_by_path(path: str):
+        calls.append(path)
+        if path == literal:
+            return canonical
+        raise KeyError(path)
+
+    archive = SimpleNamespace(
+        get_entry_by_path=get_entry_by_path,
+        has_entry_by_title=lambda title: False,
+    )
+
+    assert server._entry(archive, literal) is canonical
+    assert calls == [literal]
+
+
 def _never_found_archive():
     return SimpleNamespace(
         get_entry_by_path=lambda path: (_ for _ in ()).throw(
@@ -676,7 +722,7 @@ def test_article_not_found_message_guides_and_suggests(
 
     message = str(excinfo.value)
     assert "not the article title" in message
-    assert "must not be URL-encoded" in message
+    assert "single URL-encoded path is accepted" in message
     assert "Closest match: 'World_War_2'" in message
 
 

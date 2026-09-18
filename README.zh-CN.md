@@ -160,9 +160,13 @@ uv lock --check
 未知或缺失时，错误会返回该工具合法与必填的参数名；存档未知时，会返回可用的 `archive_id`
 列表；条目不存在时，会指回 `search` 和 `list_archives`。
 
+参数名是固定的：`search` 使用 `query` 和 `archive_id`；文章工具使用 `archive_id` 和
+`article_path`。`path`、`article_id`、`search_criteria` 都不是别名。
+
 `article_path` 是 ZIM 内部的不透明路径，不是条目标题：标题中的空格在路径里是下划线。传可读
-标题仍然可用，因为服务器会回退到标题查询；但手工拼接路径或对标题做 URL 编码则不行。当路径
-无法解析时，若存档的建议索引能找到相近条目，错误信息会给出该条目名。
+标题仍然可用，因为服务器会回退到标题查询。对于把返回路径编码过的客户端，服务器在原样查找
+失败后还会严格尝试一次 URL 解码；但仍应尽量原样复制返回的路径，不要手工拼接。当路径无法解析
+时，若存档的建议索引能找到相近条目，错误信息会给出该条目名。
 
 有些 ZIM 条目本身不含可读文本——例如 PhET 模拟是由 JavaScript 生成内容的 HTML 外壳。
 `read_article` 和 `inspect_article` 会返回 `status: "ok"`、`total_chars: 0`，并附带一个

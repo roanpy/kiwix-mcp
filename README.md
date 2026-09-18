@@ -202,11 +202,17 @@ argument returns the valid and required names for that tool, an unknown archive
 returns the available `archive_id` values, and a missing article points back to
 `search` and `list_archives`.
 
+Argument names are literal: `search` uses `query` and `archive_id`; article
+tools use `archive_id` and `article_path`. `path`, `article_id`, and
+`search_criteria` are not aliases.
+
 `article_path` is an opaque ZIM path rather than the article title: it uses
 underscores where the title has spaces. Passing the readable title still works,
-because the server falls back to a title lookup, but building a path by hand or
-URL-encoding a title does not. When a path cannot be resolved, the error names a
-close match from the archive's suggestion index when one exists.
+because the server falls back to a title lookup. The server also accepts one
+strict URL-decoding pass after a verbatim path miss for clients that encoded a
+returned path; copy the returned path unchanged whenever possible. When a path
+cannot be resolved, the error names a close match from the archive's suggestion
+index when one exists.
 
 Some ZIM entries carry no readable text at all — PhET simulations, for example,
 are HTML shells whose content is produced by JavaScript. `read_article` and

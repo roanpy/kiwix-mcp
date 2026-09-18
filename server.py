@@ -160,7 +160,11 @@ MCP_INSTRUCTIONS = (
     "list_references, and extract_image call; use archive_id='*' only for search "
     "across archives. "
     "Copy article_path verbatim from search results: it is a ZIM path, not the "
-    "article title, and must never be URL-encoded or built by hand. "
+    "article title. The server tolerates one URL-decoding pass only when a "
+    "verbatim lookup misses, but copying the returned value is always preferred. "
+    "Argument names are literal: search uses query, and article tools use "
+    "archive_id plus article_path; article_id, path, and search_criteria are not "
+    "aliases. "
     "Choose the archive by language and collection: prefer full archives for "
     "coverage and maxi archives "
     "when images matter; use title, date, and description to break ties. "
@@ -300,18 +304,29 @@ def _raw_entry(archive: Archive, article_path: str):
             "article_path is required. Pass an article_path from search results, "
             "or an archive's main_entry_path from list_archives."
         )
-    try:
-        return archive.get_entry_by_path(article_path)
-    except KeyError:
-        pass
+    raw_path = str(article_path)
+    candidates = [raw_path]
+    if "%" in raw_path:
+        try:
+            decoded_path = unquote(raw_path, errors="strict")
+        except UnicodeDecodeError:
+            decoded_path = raw_path
+        if decoded_path != raw_path:
+            candidates.append(decoded_path)
+    for candidate in candidates:
+        try:
+            return archive.get_entry_by_path(candidate)
+        except KeyError:
+            pass
     # Agents commonly pass the human-readable title (spaces) where the ZIM
     # stores a path (underscores), so resolve by title before giving up.
-    title = str(article_path).replace("_", " ").strip()
-    try:
-        if title and archive.has_entry_by_title(title):
-            return archive.get_entry_by_title(title)
-    except (OSError, RuntimeError):
-        pass
+    for candidate in candidates:
+        title = candidate.replace("_", " ").strip()
+        try:
+            if title and archive.has_entry_by_title(title):
+                return archive.get_entry_by_title(title)
+        except (OSError, RuntimeError):
+            pass
     raise ValueError(_article_not_found_message(archive, article_path))
 
 
@@ -331,8 +346,8 @@ def _article_not_found_message(archive: Archive, article_path: str) -> str:
         hint = f" Closest match: {candidates[0]!r}."
     return (
         f"Article not found: {article_path!r}. Pass an article_path copied exactly "
-        f"from a search result in this archive; it is not the article title and "
-        f"must not be URL-encoded.{hint}"
+        f"from a search result in this archive; it is not the article title. "
+        f"A single URL-encoded path is accepted, but do not build paths by hand.{hint}"
     )
 
 
@@ -4542,7 +4557,11 @@ _TOOL_DEFINITIONS = [
         name="list_archives",
         title="List ZIM archives",
         description="List the ZIM archives available here. This is the discovery entry point: call it first to get the exact archive_id values every other tool needs, plus language, flavour and main_entry_path.",
-        inputSchema={"type": "object", "properties": {}},
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
         outputSchema={
             "type": "object",
             "properties": {
@@ -4619,6 +4638,7 @@ _TOOL_DEFINITIONS = [
                     "description": "Filter cross-archive search by flavour (e.g. 'maxi', 'nopic'); only effective with archive_id='*'.",
                 },
             },
+            "additionalProperties": False,
             "required": ["query", "archive_id"],
         },
         outputSchema={
@@ -4673,9 +4693,16 @@ _TOOL_DEFINITIONS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "archive_id": {"type": "string"},
-                "article_path": {"type": "string"},
+                "archive_id": {
+                    "type": "string",
+                    "description": "Exact archive_id returned by list_archives.",
+                },
+                "article_path": {
+                    "type": "string",
+                    "description": "Copy article_path verbatim from search results; it is not a title.",
+                },
             },
+            "additionalProperties": False,
             "required": ["archive_id", "article_path"],
         },
         outputSchema={
@@ -4755,7 +4782,7 @@ _TOOL_DEFINITIONS = [
                 },
                 "article_path": {
                     "type": "string",
-                    "description": "Required. Copy article_path exactly from a search result; it is not the article title and must not be URL-encoded.",
+                    "description": "Required. Copy article_path exactly from a search result; it is not the article title. One URL-encoded pass is tolerated as a fallback.",
                 },
                 "query": {
                     "type": "string",
@@ -4790,6 +4817,7 @@ _TOOL_DEFINITIONS = [
                     "description": "Read one heading subtree by the title or anchor returned by inspect_article.",
                 },
             },
+            "additionalProperties": False,
             "required": ["archive_id", "article_path"],
         },
         outputSchema={
@@ -4908,12 +4936,19 @@ _TOOL_DEFINITIONS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "archive_id": {"type": "string"},
-                "article_path": {"type": "string"},
+                "archive_id": {
+                    "type": "string",
+                    "description": "Exact archive_id returned by list_archives.",
+                },
+                "article_path": {
+                    "type": "string",
+                    "description": "Copy article_path verbatim from search results; it is not a title.",
+                },
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 "citation_label": {"type": "string"},
             },
+            "additionalProperties": False,
             "required": ["archive_id", "article_path"],
         },
         outputSchema={
@@ -4984,14 +5019,21 @@ _TOOL_DEFINITIONS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "archive_id": {"type": "string"},
-                "article_path": {"type": "string"},
+                "archive_id": {
+                    "type": "string",
+                    "description": "Exact archive_id returned by list_archives.",
+                },
+                "article_path": {
+                    "type": "string",
+                    "description": "Copy article_path verbatim from search results; it is not a title.",
+                },
                 "image_index": {"type": "integer", "minimum": 0},
                 "image_path": {
                     "type": "string",
                     "description": "Choose an exact image_path returned by read_article; overrides image_index.",
                 },
             },
+            "additionalProperties": False,
             "required": ["archive_id", "article_path"],
         },
         annotations=WRITES_CACHE,
