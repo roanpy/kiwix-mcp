@@ -71,6 +71,24 @@ The server uses the MCP 2.x low-level `Server` API and keeps the legacy
 initialize/session path available for older MCP clients. Tool names and the
 stdio command are part of the interface and stay stable.
 
+### Pi clients
+
+For [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter), add
+`"directTools": true` and `"exposeResources": false` to the `kiwix` server
+configuration. This exposes the six tools with their actual argument schemas
+and avoids turning each archive's main-entry resource into another tool. Start
+a new Pi session to load the configuration; connections remain lazy.
+
+Call `kiwix_search` directly with `{"archive_id":"*","query":"topic","limit":5}`.
+If using the `mcp` gateway instead, nest those parameters inside `args`:
+`{"tool":"kiwix_search","args":{"archive_id":"*","query":"topic","limit":5}}`.
+Putting `query` beside `tool` does not pass it to Kiwix. On a validation error,
+check the advertised schema and correct the parameters before retrying; repeating
+the same failed call cannot help. `read_article.max_chars` must be 1000–50000.
+
+An error such as `generation failed` before any tool call comes from the model
+provider; inspect the inference service logs, rather than retrying Kiwix.
+
 Tools:
 
 - `list_archives`: list ZIM metadata, including available search indexes,

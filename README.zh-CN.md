@@ -63,6 +63,20 @@ export KIWIX_ARCHIVE_DIR=/path/to/your/zim/files
 服务器使用 MCP 2.x 的底层 `Server` API，同时保留旧版 initialize/session 路径以兼容较老的
 MCP 客户端。工具名和 stdio 命令属于对外接口，保持稳定。
 
+### Pi 客户端
+
+使用 [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) 时，在 `kiwix`
+服务器配置中加入 `"directTools": true` 和 `"exposeResources": false`，让模型直接看到
+六个工具的真实参数结构，避免把各存档首页资源额外转成工具。新建 Pi 会话加载配置；连接仍按需启动。
+
+直接调用 `kiwix_search` 时，参数为 `{"archive_id":"*","query":"主题","limit":5}`。
+若使用 `mcp` 网关，则必须嵌套在 `args` 中：
+`{"tool":"kiwix_search","args":{"archive_id":"*","query":"主题","limit":5}}`。
+把 `query` 放在 `tool` 旁边不会把查询词传给 Kiwix。参数校验失败后应核对工具参数结构，
+修正后再试，不要重复同一失败调用。`read_article.max_chars` 的范围是 1000–50000。
+
+在发出工具调用之前出现的 `generation failed` 来自模型服务；应检查推理服务日志。
+
 工具：
 
 - `list_archives`：列出 ZIM 元数据，包括可用的检索索引、`flavour`（例如 `maxi` 或

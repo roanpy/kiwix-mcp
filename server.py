@@ -165,6 +165,8 @@ MCP_INSTRUCTIONS = (
     "Argument names are literal: search uses query, and article tools use "
     "archive_id plus article_path; article_id, path, and search_criteria are not "
     "aliases. "
+    "After an argument error, check the tool's input schema and correct the call "
+    "before retrying; never repeat an unchanged failing call. "
     "Choose the archive by language and collection: prefer full archives for "
     "coverage and maxi archives "
     "when images matter; use title, date, and description to break ties. "
@@ -4599,7 +4601,7 @@ _TOOL_DEFINITIONS = [
     Tool(
         name="search",
         title="Search a ZIM archive",
-        description="Search a ZIM archive. Required: query and archive_id from list_archives; pass archive_id exactly, or '*' to aggregate archives. Use limit/offset for result pages.",
+        description='Search a ZIM archive. Arguments: {"archive_id":"*","query":"topic","limit":5}. Required: query and archive_id from list_archives; use an exact ID or "*" to aggregate archives. Use limit/offset for result pages.',
         inputSchema={
             "type": "object",
             "properties": {
@@ -4792,7 +4794,7 @@ _TOOL_DEFINITIONS = [
                     "type": "integer",
                     "minimum": 1000,
                     "maximum": 50000,
-                    "description": "Maximum characters returned in this window; use this instead of limit.",
+                    "description": "Maximum characters returned, from 1000 to 50000 (e.g. 2000); omit for the default. Use this instead of limit.",
                 },
                 "limit": {
                     "type": "integer",
