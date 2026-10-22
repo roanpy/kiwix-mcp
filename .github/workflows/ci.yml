@@ -24,4 +24,5 @@ jobs:
       - run: uv sync --frozen --all-groups
       - run: uv run --frozen ruff check .
       - run: uv run --frozen ruff format --check .
+      - run: uv build
       - run: uv run --frozen pytest -q
