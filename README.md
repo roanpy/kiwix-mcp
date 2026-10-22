@@ -22,6 +22,11 @@ uv sync --frozen
 uv run --frozen python server.py
 ```
 
+To build installable artifacts, run `uv build`. The wheel and sdist explicitly
+include `server.py`, `zh_variants.py`, both project and third-party notices, and
+the bundled Apache-2.0 license. Install the wheel into an isolated environment
+and run `python -m server`; this does not depend on the source checkout.
+
 ## Get archives and point the server at them
 
 Download ZIM files from the [Kiwix library](https://library.kiwix.org/), for
@@ -93,12 +98,16 @@ Tools:
 
 - `list_archives`: list ZIM metadata, including available search indexes,
   `flavour` (for example `maxi` or `nopic`), `has_main_entry`, and
-  `main_entry_path` for archive selection.
+  `main_entry_path` for archive selection. `maxi` means more media assets; it
+  does not mean more articles. Full `all` collections cover more topics than
+  selected `wp1-0.8` collections.
 - `search`: search one selected archive with exact-title priority, pagination,
   an estimated match count, and per-result `match_type`; use `archive_id="*"`
   for a small cross-archive comparison. Added `mode` parameter:
-  `auto` (default), `fulltext`, or `title`. `fulltext` is strict and fails on
-  archives without full-text index; `title` forces title-only suggestion lookup.
+  `auto` (default), `fulltext`, or `title`. `fulltext` fails for a single archive
+  without a full-text index; in `archive_id="*"` mode, an archive without that
+  index is reported in `errors` while the indexed archives are still searched.
+  `title` forces title-only suggestion lookup.
   Optional `language` and `flavour` filter archives in cross-archive mode only.
   Redirect aliases are deduplicated before pagination. Follow `next_offset`
   with the same query, archive selection, mode and filters. Search offsets are
@@ -109,6 +118,11 @@ Tools:
   If two archives cover the same material, the same `article_path` can appear
   once per archive — that is deliberate, since the archives are different
   snapshots. Search one archive, or filter by `flavour`, to avoid the repeat.
+  A miss is not proof that a topic is absent. `guidance`, `partial`, filter
+  counts, and `errors` explain whether the result is a filtered miss or an
+  incomplete search; recovery requires an explicit caller decision and never
+  silently changes the archive. Language and flavour filters apply only with
+  `archive_id="*"`; `filters.applied` states whether they took effect.
 - `inspect_article`: return a clean lead, heading outline with section URIs,
   MediaWiki infobox facts, redirect/canonical metadata, archive language/date,
   and reference count without returning the full article.
@@ -222,7 +236,9 @@ returns the available `archive_id` values, and a missing article points back to
 
 Argument names are literal: `search` uses `query` and `archive_id`; article
 tools use `archive_id` and `article_path`. `path`, `article_id`, and
-`search_criteria` are not aliases.
+`search_criteria` are not aliases. Arguments must be a JSON object; omitted or
+`null` arguments are accepted for discovery, while strings, lists, arrays,
+scalars, and other non-object values are rejected.
 
 `article_path` is an opaque ZIM path rather than the article title: it uses
 underscores where the title has spaces. Passing the readable title still works,
@@ -230,7 +246,9 @@ because the server falls back to a title lookup. The server also accepts one
 strict URL-decoding pass after a verbatim path miss for clients that encoded a
 returned path; copy the returned path unchanged whenever possible. When a path
 cannot be resolved, the error names a close match from the archive's suggestion
-index when one exists.
+index when one exists. Title lookup and exact suggestion comparison collapse
+repeated whitespace and treat underscores as spaces; full-text search still
+receives the original query text.
 
 Some ZIM entries carry no readable text at all — PhET simulations, for example,
 are HTML shells whose content is produced by JavaScript. `read_article` and
@@ -238,9 +256,22 @@ are HTML shells whose content is produced by JavaScript. `read_article` and
 explaining why, so a blank result is not mistaken for a broken archive. Those
 entries are still discoverable through title search.
 
+Source entries larger than 16 MiB (`MAX_ARTICLE_BYTES`) are rejected by
+`inspect_article`, `read_article`, `list_references`, and resources before
+parsing. `max_chars` limits returned text but cannot bypass this source-loading
+limit; choose a smaller article or another archive when that error occurs.
+
+Chinese character-variant expansion is enabled by default with
+`KIWIX_MCP_ZH_VARIANTS=auto`. A query containing Han characters may add one
+simplified or traditional character-level variant; ambiguous reverse mappings
+stay excluded. Set `KIWIX_MCP_ZH_VARIANTS=off` to disable expansion. English
+queries and `off` mode do not import `zh_variants.py` or its mapping.
+
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE). OpenCC-derived character data and its
+Apache-2.0 license are documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 This is not a free choice: the server links against
 [`libzim`](https://github.com/openzim/python-libzim), which is licensed

@@ -11,6 +11,7 @@ import pytest
 from mcp.types import ImageContent, TextContent
 
 import server
+import zh_variants
 
 
 def _search_archive(**attributes):
@@ -309,6 +310,16 @@ def test_max_chars_is_not_overridden_by_limit_when_explicit(
     assert chars(max_chars=1500, limit=9000) == 1500
 
 
+def test_oversized_article_recovery_matches_the_real_limit() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        server._too_large(server.MAX_ARTICLE_BYTES + 1)
+    message = str(excinfo.value)
+    assert f"{server.MAX_ARTICLE_BYTES}-byte source limit" in message
+    assert "No article-reading tool can open it" in message
+    assert "max_chars reduces returned text only" in message
+    assert "Call inspect_article for its outline" not in message
+
+
 def test_read_article_accepts_limit_compatibility_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -384,6 +395,31 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert "image_path" in tools["extract_image"].input_schema["properties"]
 
 
+def test_packaging_metadata_includes_runtime_modules_and_notices() -> None:
+    import tomllib
+
+    root = Path(__file__).resolve().parent.parent
+    metadata = tomllib.loads((root / "pyproject.toml").read_text())
+
+    assert metadata["build-system"]["build-backend"] == "setuptools.build_meta"
+    assert set(metadata["tool"]["setuptools"]["py-modules"]) == {
+        "server",
+        "zh_variants",
+    }
+    assert set(metadata["project"]["license-files"]) >= {
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+        "LICENSES/*",
+    }
+    for relative in (
+        "LICENSE",
+        "MANIFEST.in",
+        "THIRD_PARTY_NOTICES.md",
+        "LICENSES/Apache-2.0.txt",
+    ):
+        assert (root / relative).is_file()
+
+
 def test_links_recognize_see_also_despite_converter_markup_id() -> None:
     """zh.wikipedia emits ids like "扩-{展}-阅读"; match on id or heading text."""
     archive = SimpleNamespace(has_entry_by_path=lambda path: True)
@@ -448,6 +484,8 @@ def test_cross_archive_fulltext_survives_archive_without_index(
     assert [item["article_path"] for item in result["results"]] == ["a", "b"]
     assert [error["archive_id"] for error in result["errors"]] == ["bad.zim"]
     assert "does not support full-text search" in result["errors"][0]["error"]
+    assert result["partial"] is True
+    assert "Results are partial" in result["guidance"]
 
 
 def test_single_archive_fulltext_stays_strict(
@@ -606,6 +644,32 @@ def test_dispatch_treats_null_arguments_as_empty() -> None:
     assert result["status"] in {"ok", "empty"}
 
 
+def test_mcp_handler_does_not_swallow_false_like_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", "/nonexistent-test-directory")
+    for bad in (False, 0, "", []):
+        result = asyncio.run(
+            server._call_tool_v2(
+                None, SimpleNamespace(name="list_archives", arguments=bad)
+            )
+        )
+        assert result.is_error is True
+        assert "expected a JSON object of named parameters" in result.content[0].text
+
+    empty = asyncio.run(
+        server._call_tool_v2(None, SimpleNamespace(name="list_archives", arguments={}))
+    )
+    assert empty.is_error is not True
+
+    omitted = asyncio.run(
+        server._call_tool_v2(
+            None, SimpleNamespace(name="list_archives", arguments=None)
+        )
+    )
+    assert omitted.is_error is not True
+
+
 def test_dispatch_reports_missing_required_arguments() -> None:
     with pytest.raises(ValueError) as excinfo:
         server._dispatch_tool("search", {})
@@ -653,6 +717,24 @@ def test_article_path_falls_back_to_title() -> None:
         get_entry_by_title=lambda title: canonical,
     )
     assert server._entry(archive, "Machine learning") is canonical
+
+
+def test_article_path_title_fallback_normalizes_whitespace() -> None:
+    canonical = SimpleNamespace(path="Machine_learning", is_redirect=False)
+    looked_up: list[str] = []
+
+    def has_title(title: str) -> bool:
+        looked_up.append(title)
+        return title == "Machine learning"
+
+    archive = SimpleNamespace(
+        get_entry_by_path=lambda path: (_ for _ in ()).throw(KeyError(path)),
+        has_entry_by_title=has_title,
+        get_entry_by_title=lambda title: canonical,
+    )
+
+    assert server._entry(archive, "  Machine___learning  ") is canonical
+    assert looked_up == ["Machine learning"]
 
 
 def test_article_path_accepts_one_url_encoded_fallback() -> None:
@@ -1094,6 +1176,128 @@ def test_search_title_mode_forces_suggestion(
     assert result["results"][0]["match_type"] == "title"
 
 
+def test_search_reuses_bounded_title_suggestions_for_exact_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=True,
+        has_title_index=True,
+        has_entry_by_title=lambda query: False,
+    )
+    suggestion_queries: list[str] = []
+    fulltext_queries: list[str] = []
+    suggestions = SimpleNamespace(
+        getResults=lambda start, limit: [
+            "A/Fainting_goats",
+            "A/Fainting_goat",
+        ][start : start + limit],
+        getEstimatedMatches=lambda: 2,
+    )
+    fulltext = SimpleNamespace(
+        getResults=lambda start, limit: ["Noise"],
+        getEstimatedMatches=lambda: 1,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda archive: SimpleNamespace(
+            suggest=lambda query: suggestion_queries.append(query) or suggestions
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "Query",
+        lambda: SimpleNamespace(set_query=lambda value: SimpleNamespace(query=value)),
+    )
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(
+            search=lambda query: fulltext_queries.append(query.query) or fulltext
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {"article_path": path},
+    )
+
+    result = server.search("  fainting_goat  ", "test.zim", limit=3)
+
+    assert suggestion_queries == ["fainting goat"]
+    assert fulltext_queries == ["fainting_goat"]
+    assert [item["article_path"] for item in result["results"]] == [
+        "A/Fainting_goat",
+        "Noise",
+    ]
+    assert result["results"][0]["match_type"] == "exact_title"
+
+
+def test_near_title_suggestion_is_not_promoted_to_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=True,
+        has_title_index=True,
+        has_entry_by_title=lambda query: False,
+    )
+    suggestions = SimpleNamespace(
+        getResults=lambda start, limit: ["A/Fainting_goats"],
+        getEstimatedMatches=lambda: 1,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda archive: SimpleNamespace(suggest=lambda query: suggestions),
+    )
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(
+            search=lambda query: SimpleNamespace(
+                getResults=lambda start, limit: ["A/Fainting_goats"],
+                getEstimatedMatches=lambda: 1,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {"article_path": path},
+    )
+
+    result = server.search("fainting_goat", "test.zim")
+
+    assert result["results"][0]["match_type"] == "fulltext"
+
+
+def test_exact_suggestion_uses_display_title_and_legacy_namespace() -> None:
+    titles = {
+        "Help:Google": "Google",
+        "A/C++": "",
+        "A/Googles": "Googles",
+    }
+    archive = SimpleNamespace(
+        get_entry_by_path=lambda path: SimpleNamespace(title=titles[path])
+    )
+    suggestions = SimpleNamespace(
+        getResults=lambda start, limit: list(titles)[start : start + limit]
+    )
+
+    assert server._exact_suggested_path(archive, suggestions, "google") == "Help:Google"
+    assert server._exact_suggested_path(archive, suggestions, "C++") == "A/C++"
+    assert server._exact_suggested_path(archive, suggestions, "A/C++") is None
+    assert server._exact_suggested_path(archive, suggestions, "Googler") is None
+
+
 def test_search_cross_archive_with_fulltext_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1201,6 +1405,69 @@ def test_search_cross_archive_filters_by_language(
     # unknown language matches nothing
     result = server.search("query", "*", language="xx")
     assert result["results"] == []
+
+
+def test_search_no_hits_explains_coverage_without_changing_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=True, has_entry_by_title=lambda query: False
+    )
+    empty = SimpleNamespace(
+        getResults=lambda start, limit: [],
+        getEstimatedMatches=lambda: 0,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: empty),
+    )
+
+    result = server.search("missing topic", "test.zim")
+
+    assert result["status"] == "no_hits"
+    assert result["searched_archives"] == 1
+    assert result["filtered_archives"] == 0
+    assert result["filters"]["applied"] is False
+    assert "maxi flavour adds media" in result["guidance"]
+    assert "never switches archives" in result["guidance"]
+
+
+def test_search_filter_miss_and_single_archive_ignore_are_explained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=True,
+        has_entry_by_title=lambda query: False,
+        get_metadata=lambda key: b"eng" if key == "Language" else b"nopic",
+    )
+    empty = SimpleNamespace(
+        getResults=lambda start, limit: [],
+        getEstimatedMatches=lambda: 0,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: empty),
+    )
+
+    filtered = server.search("topic", "*", language="zh")
+    assert filtered["filters"]["applied"] is True
+    assert filtered["searched_archives"] == 0
+    assert filtered["filtered_archives"] == 1
+    assert "1 archive(s) were filtered out" in filtered["guidance"]
+
+    ignored = server.search("topic", "test.zim", language="zh")
+    assert ignored["filters"]["applied"] is False
+    assert "filters were ignored" in ignored["guidance"]
 
 
 def test_search_language_filter_strips_metadata_whitespace(
@@ -1877,8 +2144,57 @@ def test_query_variants_only_differ_for_traditional() -> None:
     assert server._query_variants("Alan Turing") == ["Alan Turing"]
 
 
+def test_chinese_variants_are_lazy_and_can_be_disabled() -> None:
+    root = Path(__file__).resolve().parent.parent
+    script = """
+import os
+import sys
+import server
+
+query = os.environ["TEST_QUERY"]
+expected = os.environ["TEST_EXPECTED"]
+assert server._query_variants(query) == ([query] if expected == "same" else [query, expected])
+print("loaded" if "zh_variants" in sys.modules else "not-loaded")
+"""
+
+    english = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env={**os.environ, "TEST_QUERY": "Alan Turing", "TEST_EXPECTED": "same"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert english.stdout.strip() == "not-loaded"
+
+    off = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env={
+            **os.environ,
+            "KIWIX_MCP_ZH_VARIANTS": "off",
+            "TEST_QUERY": "圖靈",
+            "TEST_EXPECTED": "same",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert off.stdout.strip() == "not-loaded"
+
+    automatic = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env={**os.environ, "TEST_QUERY": "圖靈", "TEST_EXPECTED": "图灵"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert automatic.stdout.strip() == "loaded"
+
+
 def test_reverse_map_drops_ambiguous_simplified_chars() -> None:
-    reverse = server._simplified_to_traditional()
+    reverse = zh_variants.simplified_to_traditional()
     # 發 and 髮 both map to 发, so 发 must not reverse-map at all
     assert "发" not in reverse
     # Three-or-more-way collisions must stay excluded after later entries.

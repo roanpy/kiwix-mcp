@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include README.zh-CN.md
+include THIRD_PARTY_NOTICES.md
+include uv.lock
+recursive-include LICENSES *.txt
+recursive-include tests *.py

@@ -19,6 +19,10 @@ uv sync --frozen
 uv run --frozen python server.py
 ```
 
+需要构建安装包时可运行 `uv build`。wheel 与 sdist 会显式包含 `server.py`、
+`zh_variants.py`、项目及第三方声明，以及随包分发的 Apache-2.0 许可证。可将 wheel 安装到
+隔离环境后运行 `python -m server`，不依赖源码目录。
+
 ## 获取存档并指定目录
 
 从 [Kiwix 官方库](https://library.kiwix.org/) 下载 ZIM 文件，例如
@@ -80,17 +84,22 @@ MCP 客户端。工具名和 stdio 命令属于对外接口，保持稳定。
 工具：
 
 - `list_archives`：列出 ZIM 元数据，包括可用的检索索引、`flavour`（例如 `maxi` 或
-  `nopic`）、`has_main_entry`，以及用于选择存档的 `main_entry_path`。
+  `nopic`）、`has_main_entry`，以及用于选择存档的 `main_entry_path`。`maxi` 表示包含更多
+  媒体资源，不代表条目更多；`all` 完整集合通常比 `wp1-0.8` 这类精选子集覆盖更多主题。
 - `search`：在选定存档中检索，精确标题优先，支持分页、估算命中数和每条结果的
   `match_type`；用 `archive_id="*"` 做小规模跨库对照。`mode` 参数可选 `auto`（默认）、
-  `fulltext` 或 `title`。`fulltext` 是严格模式，遇到没有全文索引的存档会失败；`title`
-  强制只走标题建议查询。可选的 `language` 和 `flavour` 仅在跨库模式下过滤存档。
+  `fulltext` 或 `title`。单库 `fulltext` 遇到没有全文索引的存档会失败；跨库
+  （`archive_id="*"`）时，无全文索引的存档会记入 `errors`，有索引的存档仍继续检索。
+  `title` 强制只走标题建议查询。可选的 `language` 和 `flavour` 仅在跨库模式下过滤存档。
   重定向别名会在分页前去重。续页时用相同的 query、存档选择、mode 和过滤条件配合
   `next_offset`。检索偏移量上限为 0–1000，超出这个窗口请收窄查询词。
   跨库结果的顺序是精确标题优先，其后按存档与变体顺序排列，并非全局可比较的相关性得分。
   `estimated_matches` 是各存档中每个变体最大估算值的累加，不是精确的唯一结果数。
   若两个存档覆盖相同内容，同一 `article_path` 可能每个存档各出现一次——这是刻意的，
   因为它们是不同快照。只搜单个存档或按 `flavour` 过滤即可避免重复。
+  未命中不等于主题不存在；`guidance`、`partial`、过滤计数和 `errors` 会说明这是过滤后
+  未命中，还是检索不完整。恢复时由调用方显式选择，不会静默切换存档。语言和 `flavour`
+  过滤只在 `archive_id="*"` 时生效，`filters.applied` 会明确表示是否实际应用。
 - `inspect_article`：返回干净的导语、带章节 URI 的标题大纲、MediaWiki 信息框事实、重定向
   与规范路径元数据、存档语言与日期，以及引用数量，而不返回全文。
 - `read_article`：返回干净且长度有界的正文，支持 `next_offset` 续读、按标题或 anchor 选择
@@ -175,20 +184,31 @@ uv lock --check
 列表；条目不存在时，会指回 `search` 和 `list_archives`。
 
 参数名是固定的：`search` 使用 `query` 和 `archive_id`；文章工具使用 `archive_id` 和
-`article_path`。`path`、`article_id`、`search_criteria` 都不是别名。
+`article_path`。`path`、`article_id`、`search_criteria` 都不是别名。参数必须是 JSON
+对象；发现类工具允许省略参数或传 `null`，字符串、列表、数组、标量等非对象值会被拒绝。
 
 `article_path` 是 ZIM 内部的不透明路径，不是条目标题：标题中的空格在路径里是下划线。传可读
 标题仍然可用，因为服务器会回退到标题查询。对于把返回路径编码过的客户端，服务器在原样查找
 失败后还会严格尝试一次 URL 解码；但仍应尽量原样复制返回的路径，不要手工拼接。当路径无法解析
-时，若存档的建议索引能找到相近条目，错误信息会给出该条目名。
+时，若存档的建议索引能找到相近条目，错误信息会给出该条目名。标题查找和精确建议比较会折叠
+重复空白并把下划线视为空格；全文检索仍接收原始查询文本。
 
 有些 ZIM 条目本身不含可读文本——例如 PhET 模拟是由 JavaScript 生成内容的 HTML 外壳。
 `read_article` 和 `inspect_article` 会返回 `status: "ok"`、`total_chars: 0`，并附带一个
 `note` 说明原因，以免把空结果误判为存档损坏。这些条目仍可通过标题检索发现。
 
+源条目超过 16 MiB（`MAX_ARTICLE_BYTES`）时，`inspect_article`、`read_article`、
+`list_references` 和资源读取都会在解析前拒绝。`max_chars` 只限制返回文本，不能绕过这个
+源文件加载上限；遇到此错误请选择较小条目或另一个存档。
+
+中文字符级变体扩展默认启用（`KIWIX_MCP_ZH_VARIANTS=auto`）。查询包含汉字时，最多增加一个
+简体或繁体字符级变体；有歧义的反向映射仍会排除。设为 `off` 可关闭扩展。英文查询和 `off`
+模式都不会导入 `zh_variants.py` 及其映射表。
+
 ## 许可证
 
-GPL-3.0-or-later。详见 [LICENSE](LICENSE)。
+GPL-3.0-or-later。详见 [LICENSE](LICENSE)。OpenCC 派生字符数据及其 Apache-2.0 许可证见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 这不是可以自由选择的：本服务器链接了 [`libzim`](https://github.com/openzim/python-libzim)，
 后者采用 GPL-3.0-or-later，因此分发构建必须是 GPL 兼容的。这也与 Kiwix 工具链的其余部分
