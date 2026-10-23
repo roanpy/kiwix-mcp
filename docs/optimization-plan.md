@@ -95,6 +95,14 @@ zero-estimate/title-hit contradiction introduced by the underscore-title fix;
 a regression test (90 passed). The Pi run also confirmed image recall and noted
 that ZIM content MIME may differ from the source path extension.
 
+A follow-up semantic audit on real archives found three page-boundary
+ambiguities: a reference offset past the last page returned `no_hits` while
+reporting references, a text offset past the end returned an unexplained empty
+window, and the 1000-offset search window ended with `next_offset: null` while
+more matches could exist. Each now carries an explicit `note` or `guidance`, with
+regression tests (93 passed); an official-client check and 91 real-data invariant
+assertions cover the same boundaries.
+
 | Check | Verified result |
 | --- | --- |
 | Python 3.12.11 | 89 passed; project environment restored to this version |

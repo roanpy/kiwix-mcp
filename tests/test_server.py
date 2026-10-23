@@ -343,6 +343,65 @@ def test_read_article_accepts_limit_compatibility_alias(
     assert result["next_offset"] == 1000
 
 
+def test_read_article_offset_at_end_explains_empty_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "x" * 2000
+    item = SimpleNamespace(
+        size=len(text), mimetype="text/plain", content=text.encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    result = server.read_article(
+        "test.zim",
+        "article",
+        offset=len(text),
+        include_images=False,
+        include_links=False,
+    )
+
+    assert result["text"] == ""
+    assert result["offset"] == len(text)
+    assert "at or beyond the end" in result["note"]
+
+
+def test_reference_offset_at_end_explains_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = (
+        '<html><body><main><div class="mw-parser-output">'
+        '<p>Claim<sup class="reference"><a href="#cite_note-a">'
+        '<span class="mw-reflink-text">[1]</span></a></sup></p>'
+        '<div class="mw-references-wrap"><ol class="references">'
+        '<li id="cite_note-a"><span class="mw-cite-backlink">^</span>A</li>'
+        "</ol></div></div></main></body></html>"
+    )
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html.encode(), title="T"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="T", title="T", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda archive, article_path: entry)
+
+    result = server.list_references("test.zim", "T", offset=5)
+
+    assert result["status"] == "no_hits"
+    assert result["total_references"] == 1
+    assert "at or beyond the last page" in result["guidance"]
+
+
 def test_archive_selection_rejects_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1664,6 +1723,41 @@ def test_search_last_offset_does_not_repeat_pages(monkeypatch) -> None:
     page = server.search("topic", "test", offset=1000)
     assert [item["article_path"] for item in page["results"]] == ["1000"]
     assert page["next_offset"] is None
+
+
+def test_search_offset_window_end_is_explained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = [f"A/{index}" for index in range(1005)]
+    archive = _search_archive(
+        has_fulltext_index=True,
+        has_title_index=False,
+        has_entry_by_title=lambda query: False,
+    )
+    outcome = SimpleNamespace(
+        getResults=lambda start, limit: paths[start : start + limit],
+        getEstimatedMatches=lambda: len(paths),
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server,
+        "Searcher",
+        lambda archive: SimpleNamespace(search=lambda query: outcome),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("q", "test.zim", limit=20, offset=990)
+
+    assert result["status"] == "ok"
+    assert result["next_offset"] is None
+    assert "window ends at offset 1000" in result["guidance"]
 
 
 def test_search_can_aggregate_all_archives(

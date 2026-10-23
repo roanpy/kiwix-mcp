@@ -1146,6 +1146,16 @@ def search(
                 "articles; selected collections such as wp1-0.8 are subsets and the "
                 "server never switches archives for you."
             )
+    if (
+        "guidance" not in result
+        and page_matches
+        and has_more
+        and offset + len(page_matches) > 1000
+    ):
+        result["guidance"] = (
+            "The result window ends at offset 1000; more matches may exist. "
+            "Narrow the query or use a smaller offset to continue."
+        )
     return result
 
 
@@ -1226,6 +1236,12 @@ def read_article(
     }
     if not text.strip():
         result["note"] = NO_TEXT_NOTE
+    elif not window.strip() and text_offset >= len(text):
+        result["note"] = (
+            f"Offset {text_offset} is at or beyond the end of the readable text "
+            f"({len(text)} characters). Use a smaller offset or omit offset to "
+            "start at the beginning."
+        )
     if include_images:
         images = images or []
         image_offset = min(max(int(image_offset), 0), len(images))
@@ -1361,11 +1377,12 @@ def list_references(
                 if reference["citation_label"] is not None
             ][:10]
     matched_references = len(references)
-    offset = min(max(int(offset), 0), len(references))
+    requested_offset = max(int(offset), 0)
+    offset = min(requested_offset, len(references))
     limit = min(max(int(limit), 1), 50)
     page = references[offset : offset + limit]
     next_offset = offset + len(page) if offset + len(page) < len(references) else None
-    return {
+    result: dict[str, Any] = {
         "status": "ok" if page else "no_hits",
         "archive_id": name,
         "article_path": entry.path,
@@ -1378,6 +1395,14 @@ def list_references(
         "references": page,
         "uri": _article_uri(name, entry.path),
     }
+    if not page and matched_references and requested_offset >= len(references):
+        result["guidance"] = (
+            f"Offset {requested_offset} is at or beyond the last page: "
+            f"{matched_references} matching reference(s) are available. "
+            f"Use offset 0 (or an offset below {matched_references}) to page "
+            "the list."
+        )
+    return result
 
 
 MAX_SEE_ALSO_LINKS = 10
@@ -2181,6 +2206,7 @@ _TOOL_DEFINITIONS = [
                     },
                 },
                 "uri": {"type": "string"},
+                "guidance": {"type": "string"},
             },
             "required": [
                 "status",

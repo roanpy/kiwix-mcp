@@ -112,6 +112,7 @@ Tools:
   Redirect aliases are deduplicated before pagination. Follow `next_offset`
   with the same query, archive selection, mode and filters. Search offsets are
   bounded to 0–1000; narrow the query to explore beyond this window.
+  When that window ends while more matches may exist, `guidance` says so.
   Cross-archive order is exact titles first, then archive/variant order, not
   globally comparable relevance scores. `estimated_matches` sums the largest
   per-variant estimate in each archive; it is not an exact unique-result count.
@@ -135,10 +136,12 @@ Tools:
   related links. `see_also` is the curated "See also" set; `links` is the broader
   lead/body set, returned even when a See also section exists so link-following
   traversal keeps its fan-out. A path never appears in both lists, and every
-  entry carries `article_path`, `title` and a `uri`.
+  entry carries `article_path`, `title` and a `uri`. An offset at or beyond the
+  end returns empty text with an explanatory `note`.
 - `list_references`: page through MediaWiki citations, notes, and preserved external
   URLs, or select a visible marker such as `1`, `a`, or `note 1` via
-  `citation_label`.
+  `citation_label`. An offset at or beyond the last page returns `no_hits` with
+  `guidance` naming the available total; use offset 0 to restart.
 - `extract_image`: return native MCP image content plus a temporary `file_path`
   fallback for clients that cannot render MCP image content. Prefer the entry
   with `primary=True` unless
