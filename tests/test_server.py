@@ -2137,7 +2137,11 @@ def test_search_traditional_query_matches_simplified_title(
 def test_exact_title_with_zero_fulltext_estimate_reports_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = _search_archive(has_fulltext_index=True, has_title_index=True)
+    archive = _search_archive(
+        has_fulltext_index=True,
+        has_title_index=True,
+        has_entry_by_title=lambda query: False,
+    )
     empty = SimpleNamespace(
         getResults=lambda start, limit: [], getEstimatedMatches=lambda: 0
     )
@@ -2164,6 +2168,17 @@ def test_exact_title_with_zero_fulltext_estimate_reports_unknown(
 
     assert [item["match_type"] for item in result["results"]] == ["exact_title"]
     assert result["estimated_matches"] is None
+
+    # A genuine empty result keeps the confirmed zero.
+    empty_suggestion = SimpleNamespace(getResults=lambda start, limit: [])
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda archive: SimpleNamespace(suggest=lambda query: empty_suggestion),
+    )
+    no_hits = server.search("nothing_here", "en_all.zim")
+    assert no_hits["results"] == []
+    assert no_hits["estimated_matches"] == 0
 
 
 def test_query_variants_only_differ_for_traditional() -> None:

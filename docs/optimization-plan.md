@@ -89,6 +89,12 @@ unpushed until review. The worker also switched the project virtual environment
 while testing Python versions; the parent restored its original Python 3.12 and
 used separate environments for the other versions.
 
+Pi running DeepSeek V4.1 Flash independently re-ran the live calls. It found a
+zero-estimate/title-hit contradiction introduced by the underscore-title fix;
+`bccd103` reports that estimate as null and locks the null/zero distinction with
+a regression test (90 passed). The Pi run also confirmed image recall and noted
+that ZIM content MIME may differ from the source path extension.
+
 | Check | Verified result |
 | --- | --- |
 | Python 3.12.11 | 89 passed; project environment restored to this version |

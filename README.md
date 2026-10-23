@@ -144,6 +144,8 @@ Tools:
   with `primary=True` unless
   another image is wanted, then pass the chosen entry's `image_path`.
   Temporary images are deduplicated and capped at the 16 most recently used files.
+  The returned `mimetype` describes the stored bytes, so a path ending in `.jpg`
+  may contain WebP data; the cached file uses the MIME-derived extension.
 
 MCP resources (2.x):
 

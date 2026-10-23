@@ -1825,7 +1825,10 @@ _TOOL_DEFINITIONS = [
                 "query": {"type": "string"},
                 "offset": {"type": "integer"},
                 "next_offset": {"type": ["integer", "null"]},
-                "estimated_matches": {"type": ["integer", "null"]},
+                "estimated_matches": {
+                    "type": ["integer", "null"],
+                    "description": "Estimated matches. null means unknown (for example a title hit without a full-text estimate); 0 means no matches were found.",
+                },
                 "mode": {"type": "string", "enum": ["auto", "fulltext", "title"]},
                 "filters": {
                     "type": "object",
