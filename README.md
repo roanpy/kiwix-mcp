@@ -115,6 +115,8 @@ Tools:
   Cross-archive order is exact titles first, then archive/variant order, not
   globally comparable relevance scores. `estimated_matches` sums the largest
   per-variant estimate in each archive; it is not an exact unique-result count.
+  When a title hit exists but no full-text estimate is available, it is `null`;
+  reporting zero alongside non-empty results would be misleading.
   If two archives cover the same material, the same `article_path` can appear
   once per archive — that is deliberate, since the archives are different
   snapshots. Search one archive, or filter by `flavour`, to avoid the repeat.

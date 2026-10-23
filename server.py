@@ -1075,6 +1075,14 @@ def search(
         results.append(item)
     has_more = len(matches) > offset + len(page_matches)
     filters_applied = cross_archive and bool(language or flavour)
+    # A zero full-text estimate can coexist with a title hit (for example an
+    # underscore query): zero would contradict a non-empty page, so report the
+    # estimate as unknown instead of misleading the caller.
+    estimated_value = (
+        None
+        if estimated_matches == 0 and results
+        else (estimated_matches if estimated_known else None)
+    )
     result: dict[str, Any] = {
         "status": "ok" if results else "no_hits",
         "query": query,
@@ -1082,7 +1090,7 @@ def search(
         "next_offset": offset + len(page_matches)
         if has_more and page_matches and offset + len(page_matches) <= 1000
         else None,
-        "estimated_matches": estimated_matches if estimated_known else None,
+        "estimated_matches": estimated_value,
         "results": results,
         "errors": errors,
         "mode": mode,

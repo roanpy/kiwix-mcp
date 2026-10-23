@@ -2134,6 +2134,38 @@ def test_search_traditional_query_matches_simplified_title(
     assert summary_queries == ["", "图灵机"]
 
 
+def test_exact_title_with_zero_fulltext_estimate_reports_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(has_fulltext_index=True, has_title_index=True)
+    empty = SimpleNamespace(
+        getResults=lambda start, limit: [], getEstimatedMatches=lambda: 0
+    )
+    suggestion = SimpleNamespace(getResults=lambda start, limit: ["Fainting_goat"])
+    monkeypatch.setattr(
+        server, "_select_paths", lambda archive_id: [("en_all.zim", Path("en_all.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda path: archive)
+    monkeypatch.setattr(
+        server, "Searcher", lambda archive: SimpleNamespace(search=lambda query: empty)
+    )
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda archive: SimpleNamespace(suggest=lambda query: suggestion),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, archive_id, article_path, query: {"article_path": article_path},
+    )
+
+    result = server.search("fainting_goat", "en_all.zim")
+
+    assert [item["match_type"] for item in result["results"]] == ["exact_title"]
+    assert result["estimated_matches"] is None
+
+
 def test_query_variants_only_differ_for_traditional() -> None:
     assert server._query_variants("圖靈") == ["圖靈", "图灵"]
     assert server._query_variants("艾伦·图灵") == ["艾伦·图灵", "艾倫·圖靈"]
