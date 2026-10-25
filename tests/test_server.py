@@ -270,6 +270,14 @@ def test_script_driven_page_gets_an_explanatory_note(
     assert read["text"] == ""
     assert read["note"] == server.NO_TEXT_NOTE
 
+    shell = server.read_article("t.zim", "sim.html")
+    assert shell["text"] == ""
+    assert shell["note"] == server.NO_TEXT_NOTE
+    assert shell["total_images"] == 0
+    assert shell["see_also"] == []
+    assert shell["links"] == []
+    assert shell["returned_links"] == 0
+
     # A page with real text must not carry the note.
     archive2, entry2 = _script_page_archive(
         "<html><body><p>Real text here</p></body></html>"
@@ -399,7 +407,307 @@ def test_reference_offset_at_end_explains_total(
 
     assert result["status"] == "no_hits"
     assert result["total_references"] == 1
+    assert result["requested_offset"] == 5
+    assert result["offset"] == 1
     assert "at or beyond the last page" in result["guidance"]
+
+
+def test_archive_paths_lists_split_first_part_and_ignores_continuations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
+    (tmp_path / "wiki.zim").write_bytes(b"x")
+    for name, data in {
+        "split.zimaa": b"a",
+        "split.zimab": b"bb",
+        "split.zimaz": b"zzz",
+        "split.zimba": b"bbbb",
+        "split.zimbb": b"bbbbb",
+        "weird[1].zimaa": b"w" * 6,
+        "weird[1].zimab": b"w" * 7,
+    }.items():
+        (tmp_path / name).write_bytes(data)
+    (tmp_path / "split.zimaa.bak").write_bytes(b"x" * 10)
+    (tmp_path / "split.zimZZ").write_bytes(b"x" * 10)
+    (tmp_path / "split.zimac").mkdir()
+    (tmp_path / "orphan.zimab").write_bytes(b"z")
+
+    paths = server._archive_paths()
+
+    assert set(paths) == {"wiki.zim", "split.zimaa", "weird[1].zimaa"}
+    # aa..az plus ba/bb, but not .bak, uppercase, directories, or unrelated files.
+    assert server._archive_size(paths["split.zimaa"]) == 15
+    assert server._archive_size(paths["weird[1].zimaa"]) == 13
+    assert server._select_paths("split.zim") == [
+        ("split.zimaa", tmp_path / "split.zimaa")
+    ]
+    assert server._select_paths("weird[1].zim") == [
+        ("weird[1].zimaa", tmp_path / "weird[1].zimaa")
+    ]
+
+
+@pytest.mark.parametrize("failure_at", ["open", "size"])
+def test_list_archives_surfaces_mixed_archive_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_at: str
+) -> None:
+    monkeypatch.setenv("KIWIX_ARCHIVE_DIR", str(tmp_path))
+    (tmp_path / "good.zim").write_bytes(b"good")
+    (tmp_path / "bad.zim").write_bytes(b"bad")
+    good = SimpleNamespace(
+        article_count=1,
+        media_count=2,
+        has_fulltext_index=True,
+        has_title_index=True,
+    )
+
+    def open_archive(path: Path):
+        if path.name == "bad.zim" and failure_at == "open":
+            raise RuntimeError("corrupt archive")
+        return good
+
+    original_size = server._archive_size
+
+    def archive_size(path: Path):
+        if path.name == "bad.zim" and failure_at == "size":
+            raise OSError("corrupt archive size")
+        return original_size(path)
+
+    monkeypatch.setattr(server, "_archive", open_archive)
+    monkeypatch.setattr(server, "_archive_size", archive_size)
+
+    result = server.list_archives()
+
+    assert result["status"] == "ok"
+    by_name = {item["archive_id"]: item for item in result["archives"]}
+    assert by_name["good.zim"]["article_count"] == 1
+    assert "error" not in by_name["good.zim"]
+    assert "corrupt archive" in by_name["bad.zim"]["error"]
+
+
+def test_search_auto_falls_back_to_title_without_fulltext_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=False,
+        has_title_index=True,
+        has_entry_by_title=lambda query: False,
+    )
+    suggestion = SimpleNamespace(
+        getResults=lambda start, limit: ["Topic"],
+        getEstimatedMatches=lambda: 1,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(suggest=lambda query: suggestion),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {"article_path": path},
+    )
+
+    result = server.search("topic", "test.zim", mode="auto")
+
+    assert result["status"] == "ok"
+    assert result["mode"] == "auto"
+    assert result["results"][0]["search_mode"] == "title"
+    assert result["results"][0]["article_path"] == "Topic"
+
+
+def test_search_without_xapian_indexes_uses_native_title_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=False,
+        has_title_index=False,
+        has_main_entry=True,
+        main_entry=SimpleNamespace(path="main", title="Main", is_redirect=False),
+        has_entry_by_title=lambda query: False,
+    )
+    native = SimpleNamespace(
+        getResults=lambda start, limit: ["Target", "Target-2", "Target-3"],
+        getEstimatedMatches=lambda: 3,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(suggest=lambda query: native),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {"article_path": path},
+    )
+
+    result = server.search("Target", "test.zim", mode="auto")
+
+    assert result["status"] == "ok"
+    assert result["errors"] == []
+    assert [item["article_path"] for item in result["results"]] == [
+        "Target",
+        "Target-2",
+        "Target-3",
+    ]
+    assert all(item["search_mode"] == "title" for item in result["results"])
+
+
+def test_search_without_xapian_indexes_still_uses_exact_title_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=False,
+        has_title_index=False,
+        has_entry_by_title=lambda query: query == "Target",
+        get_entry_by_title=lambda query: SimpleNamespace(path="Target"),
+    )
+    empty = SimpleNamespace(
+        getResults=lambda start, limit: [],
+        getEstimatedMatches=lambda: 0,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(suggest=lambda query: empty),
+    )
+    monkeypatch.setattr(
+        server,
+        "_article_summary",
+        lambda archive, name, path, query: {"article_path": path},
+    )
+
+    result = server.search("Target", "test.zim", mode="auto")
+
+    assert result["status"] == "ok"
+    assert result["results"][0]["match_type"] == "exact_title"
+    assert result["results"][0]["article_path"] == "Target"
+
+
+@pytest.mark.parametrize("failure_at", ["suggest", "estimate", "results"])
+def test_search_native_title_failure_gets_main_entry_hint(
+    monkeypatch: pytest.MonkeyPatch, failure_at: str
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=False,
+        has_title_index=False,
+        has_main_entry=True,
+        main_entry=SimpleNamespace(path="main", title="Main", is_redirect=False),
+        has_entry_by_title=lambda query: False,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+
+    def fail(*_args):
+        raise RuntimeError("native lookup failed")
+
+    native = SimpleNamespace(
+        getEstimatedMatches=fail if failure_at == "estimate" else lambda: 1,
+        getResults=fail if failure_at == "results" else lambda *_: [],
+    )
+    monkeypatch.setattr(
+        server,
+        "SuggestionSearcher",
+        lambda _: SimpleNamespace(
+            suggest=fail if failure_at == "suggest" else lambda _: native
+        ),
+    )
+
+    result = server.search("topic", "test.zim", mode="auto")
+
+    assert result["status"] == "no_hits"
+    assert result["errors"]
+    assert "Native title search failed" in result["errors"][0]["error"]
+    assert "native lookup failed" in result["errors"][0]["error"]
+    assert "main_entry_path 'main'" in result["errors"][0]["error"]
+    assert "Inspect errors" in result["guidance"]
+
+
+def test_search_fulltext_mode_is_not_silently_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _search_archive(
+        has_fulltext_index=False,
+        has_title_index=True,
+        has_entry_by_title=lambda query: False,
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+
+    with pytest.raises(ValueError, match="does not support full-text search"):
+        server.search("topic", "test.zim", mode="fulltext")
+
+
+def test_read_article_plain_text_has_no_link_or_image_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _read_text_fixture(monkeypatch, "Plain text body without markup.")
+
+    result = server.read_article("test.zim", "article")
+
+    assert result["text"] == "Plain text body without markup."
+    assert result["total_images"] == 0
+    assert result["images"] == []
+    assert result["see_also"] == []
+    assert result["links"] == []
+    assert result["returned_links"] == 0
+    assert result["total_links"] == 0
+    assert result["links_truncated"] is False
+
+
+def test_read_article_rejects_binary_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = SimpleNamespace(
+        size=8, mimetype="application/octet-stream", content=b"\x00\x01binary"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda _archive, _path: entry)
+
+    with pytest.raises(ValueError, match="not text"):
+        server.read_article("test.zim", "article")
+
+
+def test_read_article_generic_html_link_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = [f"page-{index}" for index in range(30)]
+    html = (
+        "<main>" + "".join(f'<a href="{path}">{path}</a>' for path in paths) + "</main>"
+    )
+    _read_html_fixture(monkeypatch, html, set(paths))
+
+    first = server.read_article("test.zim", "article", include_images=False)
+    second = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=25
+    )
+
+    assert [item["article_path"] for item in first["links"]] == paths[:25]
+    assert first["next_link_offset"] == 25
+    assert [item["article_path"] for item in second["links"]] == paths[25:]
+    assert second["next_link_offset"] is None
+    assert second["links_truncated"] is False
 
 
 def test_archive_selection_rejects_unknown(
@@ -444,12 +752,31 @@ def test_mcp_tool_registry_is_stable() -> None:
     assert "section" in tools["read_article"].input_schema["properties"]
     assert "offset" in tools["read_article"].input_schema["properties"]
     assert "image_offset" in tools["read_article"].input_schema["properties"]
+    assert "link_offset" in tools["read_article"].input_schema["properties"]
     article_output = tools["read_article"].output_schema["properties"]
     assert "mimetype" in article_output
     assert "images" in article_output
     assert "is_main" not in article_output["images"]["items"]["properties"]
     assert "see_also" in article_output
     assert "links" in article_output
+    assert {
+        "query_found",
+        "query_match_offset",
+        "requested_offset",
+        "link_offset",
+        "next_link_offset",
+        "links_truncated",
+        "returned_links",
+        "links_window_exhausted",
+    } <= article_output.keys()
+    assert "full-article link count" in article_output["total_links"]["description"]
+    assert "never above 1000" in article_output["next_link_offset"]["description"]
+    assert "whole article" in article_output["links"]["description"]
+    assert "at or beyond the end" in article_output["note"]["description"]
+    search_output = tools["search"].output_schema["properties"]
+    assert {"requested_offset", "window_truncated"} <= search_output.keys()
+    reference_output = tools["list_references"].output_schema["properties"]
+    assert "requested_offset" in reference_output
     assert "citation_label" in tools["list_references"].input_schema["properties"]
     assert "image_path" in tools["extract_image"].input_schema["properties"]
 
@@ -1032,6 +1359,8 @@ def test_zim_image_url_resolution() -> None:
     assert server._resolve_image_path("topic", "/assets/a.png") == "assets/a.png"
     with pytest.raises(ValueError, match="internal image"):
         server._resolve_image_path("topic", "https://example.com/a.png")
+    with pytest.raises(ValueError, match="internal image"):
+        server._resolve_image_path("topic", "#section")
 
 
 def test_image_metadata_uses_caption_and_dimensions() -> None:
@@ -1089,6 +1418,460 @@ def test_links_return_see_also_and_body_without_duplicates() -> None:
     assert links == [
         {"article_path": "body", "title": "Body", "uri": "kiwix://en_all.zim/body"}
     ]
+
+
+def _read_html_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    html: str,
+    valid_paths: set[str] | None = None,
+    article_path: str = "article",
+) -> SimpleNamespace:
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html.encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False,
+        path=article_path,
+        title="Article",
+        get_item=lambda: item,
+    )
+    valid = set(valid_paths or ())
+    archive = SimpleNamespace(has_entry_by_path=lambda path: path in valid)
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: archive)
+    monkeypatch.setattr(server, "_entry", lambda _archive, _path: entry)
+    return archive
+
+
+def _read_text_fixture(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    item = SimpleNamespace(
+        size=len(text), mimetype="text/plain", content=text.encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(server, "_archive", lambda _: SimpleNamespace())
+    monkeypatch.setattr(server, "_entry", lambda _archive, _path: entry)
+
+
+def test_read_article_paginates_combined_links_without_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    curated = [f"curated-{index}" for index in range(3)]
+    body = [f"body-{index}" for index in range(30)]
+    html = (
+        '<div class="mw-parser-output">'
+        + "".join(f'<p><a href="{path}">{path}</a></p>' for path in body)
+        + '<h2 id="See_also">See also</h2><ul>'
+        + "".join(f'<li><a href="{path}">{path}</a></li>' for path in curated)
+        + "</ul>"
+        + '<p><a href="curated-0">Duplicate curated</a></p>'
+        + "</div>"
+    )
+    _read_html_fixture(monkeypatch, html, set(curated + body))
+
+    first = server.read_article("test.zim", "article", include_images=False)
+    assert first["link_offset"] == 0
+    assert first["returned_links"] == server.MAX_LINK_PAGE == 25
+    assert first["total_links"] == first["returned_links"]
+    assert first["links_truncated"] is True
+    assert first["next_link_offset"] == 25
+    assert first["links_window_exhausted"] is False
+    assert [item["article_path"] for item in first["see_also"]] == curated
+    assert [item["article_path"] for item in first["links"]] == body[:22]
+
+    second = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=25
+    )
+    assert second["link_offset"] == 25
+    assert second["returned_links"] == 8
+    assert second["links_truncated"] is False
+    assert second["next_link_offset"] is None
+    assert second["see_also"] == []
+    assert [item["article_path"] for item in second["links"]] == body[22:]
+
+    page_paths = [
+        item["article_path"]
+        for page in (first, second)
+        for key in ("see_also", "links")
+        for item in page[key]
+    ]
+    assert len(page_paths) == len(set(page_paths)) == 33
+    assert set(page_paths) == set(curated + body)
+
+
+def test_read_article_links_skip_noise_missing_and_external(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = (
+        '<div class="mw-parser-output">'
+        '<a href="https://example.com/external">External</a>'
+        '<a href="missing">Missing</a>'
+        '<a href="#section">Same-article fragment</a>'
+        '<nav><a href="nav-link">Navigation</a></nav>'
+        '<table class="infobox"><tr><td><a href="infobox-link">Infobox</a></td></tr></table>'
+        '<p><a href="body-1">Usable</a></p>'
+        "</div>"
+    )
+    _read_html_fixture(monkeypatch, html, {"nav-link", "infobox-link", "body-1"})
+
+    result = server.read_article("test.zim", "article", include_images=False)
+
+    assert [item["article_path"] for item in result["links"]] == ["body-1"]
+    assert result["see_also"] == []
+    assert result["returned_links"] == 1
+    assert result["links_truncated"] is False
+
+
+def test_read_article_link_offsets_handle_exact_end_and_overrun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ["a", "b", "c"]
+    html = '<div class="mw-parser-output">' + "".join(
+        f'<a href="{path}">{path}</a>' for path in paths
+    )
+    _read_html_fixture(monkeypatch, html, set(paths))
+
+    exact = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=2
+    )
+    assert exact["returned_links"] == 1
+    assert exact["links_truncated"] is False
+    assert exact["next_link_offset"] is None
+
+    overrun = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=3
+    )
+    assert overrun["returned_links"] == 0
+    assert overrun["link_offset"] == 3
+    assert overrun["links_truncated"] is False
+    assert overrun["next_link_offset"] is None
+
+    clamped = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=5000
+    )
+    assert clamped["link_offset"] == server.LINK_OFFSET_LIMIT == 1000
+    assert clamped["returned_links"] == 0
+    assert clamped["links_window_exhausted"] is False
+
+
+def test_read_article_link_pagination_is_lazy_and_reports_window_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = [f"body-{index}" for index in range(1030)]
+    calls = 0
+
+    def has_entry_by_path(path: str) -> bool:
+        nonlocal calls
+        calls += 1
+        return path in set(paths)
+
+    html = '<div class="mw-parser-output">' + "".join(
+        f'<a href="{path}">{path}</a>' for path in paths
+    )
+    item = SimpleNamespace(
+        size=len(html), mimetype="text/html", content=html.encode(), title="Article"
+    )
+    entry = SimpleNamespace(
+        is_redirect=False, path="article", title="Article", get_item=lambda: item
+    )
+    monkeypatch.setattr(
+        server, "_select_paths", lambda _: [("test.zim", Path("test.zim"))]
+    )
+    monkeypatch.setattr(
+        server,
+        "_archive",
+        lambda _: SimpleNamespace(has_entry_by_path=has_entry_by_path),
+    )
+    monkeypatch.setattr(server, "_entry", lambda _archive, _path: entry)
+
+    first = server.read_article("test.zim", "article", include_images=False)
+    assert calls == server.MAX_LINK_PAGE + 1
+    assert first["links_truncated"] is True
+    assert first["next_link_offset"] == 25
+
+    calls = 0
+    last = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=1000
+    )
+    assert calls == 1000 + 1 + 1
+    assert last["link_offset"] == 1000
+    assert last["returned_links"] == 1
+    assert last["links_truncated"] is True
+    assert last["next_link_offset"] is None
+    assert last["links_window_exhausted"] is True
+    assert "link window ends at offset 1000" in last["links_guidance"]
+
+
+def test_read_article_link_window_is_exactly_0_to_1000(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = [f"body-{index}" for index in range(1030)]
+    html = '<div class="mw-parser-output">' + "".join(
+        f'<a href="{path}">{path}</a>' for path in paths
+    )
+    _read_html_fixture(monkeypatch, html, set(paths))
+
+    near_end = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=990
+    )
+    assert near_end["returned_links"] == 11
+    assert [item["article_path"] for item in near_end["links"]] == paths[990:1001]
+    assert near_end["next_link_offset"] is None
+    assert near_end["links_truncated"] is True
+    assert near_end["links_window_exhausted"] is True
+
+    at_end = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=1000
+    )
+    assert at_end["returned_links"] == 1
+    assert [item["article_path"] for item in at_end["links"]] == [paths[1000]]
+    assert at_end["next_link_offset"] is None
+    assert at_end["links_truncated"] is True
+    assert at_end["links_window_exhausted"] is True
+
+    oversized = server.read_article(
+        "test.zim", "article", include_images=False, link_offset=5000
+    )
+    assert oversized["link_offset"] == 1000
+    assert oversized["returned_links"] == 1
+
+    cursors: list[int] = []
+    seen: list[str] = []
+    cursor = 0
+    while cursor is not None:
+        page = server.read_article(
+            "test.zim", "article", include_images=False, link_offset=cursor
+        )
+        assert page["link_offset"] == cursor
+        assert len(page["see_also"]) + len(page["links"]) == page["returned_links"]
+        assert page["returned_links"] <= 25
+        seen.extend(item["article_path"] for item in page["links"])
+        cursors.append(cursor)
+        cursor = page["next_link_offset"]
+        if cursor is not None:
+            assert cursor > cursors[-1]
+    assert cursors == list(range(0, 1000, 25)) + [1000]
+    assert seen == paths[:1001]
+
+
+def test_read_article_include_links_false_skips_link_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _read_html_fixture(monkeypatch, '<div class="mw-parser-output"></div>')
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("link extraction must not run")
+
+    monkeypatch.setattr(server, "_link_candidates", unexpected)
+    monkeypatch.setattr(server, "_find_link_notes", unexpected)
+
+    result = server.read_article(
+        "test.zim", "article", include_images=False, include_links=False
+    )
+
+    assert "see_also" not in result
+    assert "links" not in result
+    assert "link_offset" not in result
+    assert "total_links" not in result
+
+
+def test_read_article_keeps_hatnote_notes_before_text_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = (
+        '<div class="mw-parser-output">'
+        '<div class="hatnote">主条目：<a href="target">目标</a></div>'
+        '<h2 id="Body">Body</h2><p>Body text.</p></div>'
+    )
+    _read_html_fixture(monkeypatch, html, {"target"})
+
+    result = server.read_article("test.zim", "article", include_images=False)
+
+    assert len(result["notes"]) == 1
+    assert result["notes"][0]["label"].startswith("主条目")
+    assert result["notes"][0]["links"][0]["article_path"] == "target"
+
+    section = server.read_article(
+        "test.zim", "article", section="Body", include_images=False
+    )
+    assert section["section"]["anchor"] == "Body"
+    assert len(section["notes"]) == 1
+    assert section["notes"][0]["links"][0]["article_path"] == "target"
+
+
+def test_see_also_traversal_stops_at_article_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = (
+        "<html><body><main>"
+        '<h2 id="See_also">See also</h2><a href="inside">Inside</a>'
+        "</main>"
+        '<footer><a href="outside">Outside</a></footer>'
+        "</body></html>"
+    )
+    _read_html_fixture(monkeypatch, html, {"inside", "outside"})
+
+    result = server.read_article("test.zim", "article", include_images=False)
+
+    assert [item["article_path"] for item in result["see_also"]] == ["inside"]
+    assert [item["article_path"] for item in result["links"]] == []
+
+
+def test_query_feedback_tracks_literal_first_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "Opening text. " + "x" * 400 + " Needle here " + "y" * 400
+    _read_text_fixture(monkeypatch, text)
+
+    found = server.read_article(
+        "test.zim", "article", query="needle", include_images=False, include_links=False
+    )
+    assert found["query_found"] is True
+    assert found["query_match_offset"] == text.lower().index("needle")
+    assert found["requested_offset"] == 0
+    assert "Needle here" in found["text"]
+    assert "query_note" not in found
+
+    missed = server.read_article(
+        "test.zim", "article", query="absent", include_images=False, include_links=False
+    )
+    assert missed["query_found"] is False
+    assert missed["query_match_offset"] is None
+    assert missed["requested_offset"] == 0
+    assert missed["text"] == text[: server.DEFAULT_MAX_CHARS]
+    assert "not at a matching passage" in missed["query_note"]
+
+    blank = server.read_article(
+        "test.zim", "article", query="   ", include_images=False, include_links=False
+    )
+    assert blank["query_found"] is None
+    assert blank["query_match_offset"] is None
+    assert "query_note" not in blank
+
+
+def test_query_feedback_continuation_keeps_requested_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "a" * 3000 + " needle " + "b" * 3000
+    _read_text_fixture(monkeypatch, text)
+
+    result = server.read_article(
+        "test.zim",
+        "article",
+        query="needle",
+        offset=2500,
+        max_chars=1000,
+        include_images=False,
+        include_links=False,
+    )
+
+    assert result["offset"] == 2500
+    assert result["requested_offset"] == 2500
+    assert result["text"] == text[2500:3500]
+    assert result["query_found"] is True
+    assert result["query_match_offset"] == text.index("needle")
+
+    beyond = server.read_article(
+        "test.zim",
+        "article",
+        offset=len(text) + 10,
+        include_images=False,
+        include_links=False,
+    )
+    assert beyond["requested_offset"] == len(text) + 10
+    assert beyond["offset"] == len(text)
+    assert "at or beyond the end" in beyond["note"]
+
+
+def test_query_feedback_is_section_local_and_unicode_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = (
+        '<div class="mw-parser-output">'
+        "<p>Lead paragraph.</p>"
+        '<h2 id="First">First</h2><p>Alpha text.</p>'
+        '<h2 id="Second">Second</h2><p>Beta needle here. Straße</p>'
+        "</div>"
+    )
+    _read_html_fixture(monkeypatch, html)
+
+    first = server.read_article(
+        "test.zim",
+        "article",
+        section="First",
+        query="needle",
+        include_images=False,
+        include_links=False,
+    )
+    assert first["query_found"] is False
+    assert first["query_match_offset"] is None
+    assert "selected section" in first["query_note"]
+
+    second = server.read_article(
+        "test.zim",
+        "article",
+        section="Second",
+        query="needle",
+        include_images=False,
+        include_links=False,
+    )
+    assert second["query_found"] is True
+    assert second["query_match_offset"] is not None
+    assert second["text"][second["query_match_offset"] :].startswith("needle")
+
+    unicode_match = server.read_article(
+        "test.zim",
+        "article",
+        section="Second",
+        query="STRASSE",
+        include_images=False,
+        include_links=False,
+    )
+    assert unicode_match["query_found"] is True
+    assert unicode_match["query_match_offset"] is not None
+    assert unicode_match["text"][unicode_match["query_match_offset"] :].startswith(
+        "Straße"
+    )
+
+
+def test_literal_query_position_maps_casefold_expansions() -> None:
+    assert server._literal_query_position("Die Straße", "STRASSE") == 4
+    assert server._literal_query_position("İstanbul", "İSTANBUL") == 0
+    assert server._literal_query_position("İstanbul", "istanbul") == -1
+    assert server._literal_query_position("text", "   ") == -1
+    # A folded match can start inside an expansion; it belongs to that original
+    # character, not to the following one.
+    assert server._literal_query_position("İx", "\u0307") == 0
+    assert server._literal_query_position("xİ", "\u0307") == 1
+    # Whitespace is trimmed from the query, and equal-length casefold takes the
+    # fast path for ordinary ASCII/CJK text.
+    assert server._literal_query_position("xx TEXT yy", "  text  ") == 3
+    assert server._literal_query_position("abc", "B") == 1
+    assert server._literal_query_position("维基百科", "百") == 2
+
+
+def test_read_article_query_inside_casefold_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _read_text_fixture(monkeypatch, "İx body")
+
+    result = server.read_article(
+        "test.zim",
+        "article",
+        query="\u0307",
+        include_images=False,
+        include_links=False,
+    )
+
+    assert result["query_found"] is True
+    assert result["query_match_offset"] == 0
+    assert result["text"].startswith("İx")
 
 
 def test_search_mode_can_forbid_fulltext_when_missing(
@@ -1756,6 +2539,9 @@ def test_search_offset_window_end_is_explained(
     result = server.search("q", "test.zim", limit=20, offset=990)
 
     assert result["status"] == "ok"
+    assert result["offset"] == 990
+    assert result["requested_offset"] == 990
+    assert result["window_truncated"] is True
     assert result["next_offset"] is None
     assert "window ends at offset 1000" in result["guidance"]
 
